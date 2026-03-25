@@ -44,11 +44,11 @@
 
   // 0 -> 1 as the diagram scrolls through the viewport
   const vh = $derived(typeof window !== 'undefined' ? window.innerHeight : 800);
-  const annotate = $derived(Math.min(Math.max((scrollY - diagramTop + vh) / 500, 0), 1));
+  const annotate = $derived(Math.min(Math.max((scrollY - diagramTop + vh * 0.75) / (vh * 0.8), 0), 1));
 
-  const showA = $derived(annotate > 0.05);
-  const showB = $derived(annotate > 0.25);
-  const showC = $derived(annotate > 0.5);
+  const showA = $derived(annotate > 0.1);
+  const showB = $derived(annotate > 0.4);
+  const showC = $derived(annotate > 0.7);
 
   const subtitleFull = 'Code a project, Fly to the Netherlands, Build a mechanical animal!';
   let subtitleText = $state('');
@@ -138,14 +138,16 @@
 
 <div class="top-bg">
 <div class="hero-wrap">
-  <img src="/images/hero.webp" alt="Hero" class="hero-image" />
+  <div class="hero-img-wrap">
+    <img src="/images/hero.webp" alt="Hero" class="hero-image" />
+    <svg class="hero-strata" viewBox="0 0 1440 80" preserveAspectRatio="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+      <polygon points="0,38 60,35 120,40 180,32 240,28 300,25 340,30 380,26 440,22 500,26 560,30 620,24 680,28 720,35 780,40 840,44 880,40 940,46 1000,50 1060,46 1100,42 1140,48 1200,52 1260,48 1300,44 1340,50 1400,46 1440,42 1440,80 0,80" fill="#4b4840" />
+    </svg>
+  </div>
   <div class="hero-overlay">
     <h1 class="hero-title">#BEEST</h1>
     <p class="hero-subtitle">{subtitleText}<span class="cursor">|</span></p>
   </div>
-  <svg class="hero-strata" viewBox="0 0 1440 80" preserveAspectRatio="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-    <polygon points="0,38 60,35 120,40 180,32 240,28 300,25 340,30 380,26 440,22 500,26 560,30 620,24 680,28 720,35 780,40 840,44 880,40 940,46 1000,50 1060,46 1100,42 1140,48 1200,52 1260,48 1300,44 1340,50 1400,46 1440,42 1440,80 0,80" fill="#4b4840" />
-  </svg>
 </div>
 
 <section class="sticker-cta">
@@ -156,16 +158,8 @@
     <div class="cta-content">
       <p class="cta-line">RSVP before</p>
       <p class="cta-line">launch,</p>
-      <div class="cta-line-with-arrow">
-        <p class="cta-line">get a <span bind:this={freeEl} class:rainbow={freeVisible} style="--i:0">f</span><span class:rainbow={freeVisible} style="--i:1">r</span><span class:rainbow={freeVisible} style="--i:2">e</span><span class:rainbow={freeVisible} style="--i:3">e</span></p>
-        <div class="cta-arrow-row">
-          <svg class="cta-arrow" viewBox="0 0 100 120" fill="none" xmlns="http://www.w3.org/2000/svg">
-            <path d="M85 8 C83 55, 75 85, 30 100" stroke="#c48382" stroke-width="10" stroke-linecap="round" fill="none"/>
-            <polygon points="2,100 28,114 28,86" fill="#c48382"/>
-          </svg>
-          <p class="cta-line cta-door">sticker</p>
-        </div>
-      </div>
+      <p class="cta-line">get a <span bind:this={freeEl} class:rainbow={freeVisible} style="--i:0">f</span><span class:rainbow={freeVisible} style="--i:1">r</span><span class:rainbow={freeVisible} style="--i:2">e</span><span class:rainbow={freeVisible} style="--i:3">e</span></p>
+      <p class="cta-line">sticker</p>
     </div>
   </div>
   <aside class="rsvp-box" aria-label="RSVP">
@@ -510,6 +504,7 @@
     z-index: 1;
     pointer-events: none;
     line-height: normal;
+    flex-wrap: wrap;
   }
 
   .hero-subtitle {
@@ -547,7 +542,7 @@
 
   .hero-strata {
     position: absolute;
-    bottom: -10px;
+    bottom: -4px;
     left: 0;
     width: 100%;
     height: 80px;
@@ -603,7 +598,7 @@
     display: block;
     width: 100%;
     line-height: 0;
-    margin: -1px 0;
+    margin: -4px 0;
     padding: 0;
     position: relative;
     z-index: 1;
@@ -706,7 +701,7 @@
   }
 
   .rainbow {
-    animation: rainbow 3s linear calc(var(--i) * 0.15s) both;
+    animation: rainbow 3s linear calc(var(--i) * 0.15s) 7 both;
   }
 
   @keyframes rainbow {
@@ -1185,20 +1180,30 @@
   }
 
   @media (max-width: 900px) {
+    .pipe { display: none; }
+
     .sticker-cta {
       flex-direction: column;
       gap: 32px;
-      padding: 48px 20px 40px;
+      padding: 100px 20px 60px;
+    }
+
+    .hero-overlay {
+      position: relative;
+      inset: auto;
+      padding: 16px 20px 0;
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 8px;
+    }
+
+    .hero-subtitle {
+      white-space: normal;
     }
 
     .cta-sticker {
       width: min(60vw, 260px);
       height: min(60vw, 260px);
-    }
-
-    .cta-arrow {
-      width: 100px;
-      height: 32px;
     }
 
     .sticker-row {
@@ -1209,6 +1214,14 @@
     .diagram {
       min-height: 0;
       width: 100%;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+
+    .callout {
+      opacity: 1 !important;
+      transform: none !important;
     }
 
     .rsvp-box {
@@ -1234,12 +1247,18 @@
       transform: translateY(-50%);
     }
 
+    .info-section {
+      flex-direction: column;
+      gap: 24px;
+      padding: 24px 20px 40px;
+    }
+
     .carousel-section {
       padding: 24px 0 90px;
     }
 
     .carousel-title {
-      left: 20px;
+      display: none;
     }
 
     .shop-carousel,
@@ -1250,17 +1269,22 @@
     }
 
     .carousel-card {
-      width: 180px;
-      padding: 9px 9px 8px;
+      width: 120px;
+      padding: 6px 6px 5px;
     }
 
     .bg-card {
-      width: 130px;
-      padding: 8px 8px 6px;
+      width: 90px;
+      padding: 5px 5px 4px;
+    }
+
+    .carousel-belt,
+    .carousel-belt-bg {
+      gap: 16px;
     }
 
     .card-caption {
-      font-size: 13px;
+      font-size: 11px;
     }
   }
 
@@ -1475,8 +1499,20 @@
       height: 220px;
     }
 
+    .rsvp-arrow { display: none; }
+
     .bottom-rsvp {
       padding: 40px 20px 48px;
+    }
+
+    .cta-group {
+      flex-direction: column;
+      gap: 20px;
+      padding: 16px;
+      margin-left: 0;
+      margin-right: 0;
+      width: 100%;
+      box-sizing: border-box;
     }
   }
 </style>

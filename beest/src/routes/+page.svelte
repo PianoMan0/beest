@@ -88,16 +88,19 @@
   let bottomEmail = $state('');
   let topUpdates = $state(true);
   let bottomUpdates = $state(true);
-  let topStatus = $state<'idle' | 'sending' | 'done' | 'error'>('idle');
-  let bottomStatus = $state<'idle' | 'sending' | 'done' | 'error'>('idle');
+  let topStatus = $state<'idle' | 'sending' | 'error'>('idle');
+  let bottomStatus = $state<'idle' | 'sending' | 'error'>('idle');
+
+  const emailRe = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  const topValid = $derived(emailRe.test(topEmail.trim()));
+  const bottomValid = $derived(emailRe.test(bottomEmail.trim()));
 
   async function submitRsvp(
     email: string,
-    updates: boolean,
-    setStatus: (s: 'idle' | 'sending' | 'done' | 'error') => void
+    setStatus: (s: 'idle' | 'sending' | 'error') => void
   ) {
     const cleaned = email.trim().replace(/[<>"'&\\]/g, '');
-    if (!cleaned || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleaned)) {
+    if (!cleaned || !emailRe.test(cleaned)) {
       setStatus('error');
       return;
     }
@@ -106,9 +109,13 @@
       const res = await fetch('/api/rsvp', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: cleaned, updates })
+        body: JSON.stringify({ email: cleaned })
       });
-      setStatus(res.ok ? 'done' : 'error');
+      if (res.ok) {
+        window.location.href = '/tutorial';
+      } else {
+        setStatus('error');
+      }
     } catch {
       setStatus('error');
     }
@@ -164,10 +171,20 @@
   </div>
   <aside class="rsvp-box" aria-label="RSVP">
     <h2>RSVP</h2>
-    <input type="email" placeholder="you@example.com" aria-label="Email" />
-    <button type="button">RSVP</button>
+    <input type="email" placeholder="you@example.com" aria-label="Email" bind:value={topEmail} />
+    <button
+      type="button"
+      class="rsvp-btn"
+      class:valid={topValid}
+      class:sending={topStatus === 'sending'}
+      disabled={!topValid || topStatus === 'sending'}
+      onclick={() => submitRsvp(topEmail, (s) => topStatus = s)}
+    >
+      {#if topStatus === 'sending'}Sending...{:else}RSVP{/if}
+    </button>
+    {#if topStatus === 'error'}<p class="rsvp-error">Something went wrong, please try again.</p>{/if}
     <label class="updates">
-      <input type="checkbox" checked />
+      <input type="checkbox" bind:checked={topUpdates} />
       <span>recieve email updates</span>
     </label>
     <p class="rsvp-note">
@@ -315,25 +332,28 @@
 </div>
 
 <section class="hackclub-section">
-  <div class="hackclub-text">
-    <h2>Is Hack Club for real?</h2>
-    <p>
-      Yes - and we do this kind of stuff all the time! Hack Club is a non-profit organization and a
-      community of 100k+ teenage makers. We run events online and in-person that reward people making
-      open source projects. Thanks to our donors we are always running crazy events at no cost for
-      teens. Previously we ran;
-    </p>
-  </div>
-  <div class="hackclub-photos">
-    <div class="photo-stack">
-      <div class="photo-frame frame-back-2"></div>
-      <div class="photo-frame frame-back-1"></div>
-      <div class="photo-frame frame-front">
-        <img src={eventPhotos[currentPhoto].src} alt={eventPhotos[currentPhoto].caption} loading="lazy" decoding="async" />
-      </div>
+  <div class="hackclub-inner">
+    <div class="hackclub-text">
+      <h2>Is Hack Club for real?</h2>
+      <p>
+        Yes - and we do this kind of stuff all the time! Hack Club is a non-profit organization and a
+        community of 100k+ teenage makers. We run events online and in-person that reward people making
+        open source projects. Thanks to our donors we are always running crazy events at no cost for
+        teens. Previously we ran;
+      </p>
     </div>
-    <p class="photo-caption">{eventPhotos[currentPhoto].caption}</p>
+    <div class="hackclub-photos">
+      <div class="photo-stack">
+        <div class="photo-frame frame-back-2"></div>
+        <div class="photo-frame frame-back-1"></div>
+        <div class="photo-frame frame-front">
+          <img src={eventPhotos[currentPhoto].src} alt={eventPhotos[currentPhoto].caption} loading="lazy" decoding="async" />
+        </div>
+      </div>
+      <p class="photo-caption">{eventPhotos[currentPhoto].caption}</p>
+    </div>
   </div>
+  <p class="faq-link">More Questions? <a href="/FAQ">Read the FAQ</a></p>
 </section>
 
 </div>
@@ -346,25 +366,43 @@
 </div>
 
 <section class="bottom-rsvp">
-  <svg class="rsvp-arrow rsvp-arrow-1" viewBox="0 0 60 120" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><polygon points="30,120 10,80 25,80 25,0 35,0 35,80 50,80" fill="#e05550"/></svg>
-  <svg class="rsvp-arrow rsvp-arrow-2" viewBox="0 0 60 120" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><polygon points="30,120 10,80 25,80 25,0 35,0 35,80 50,80" fill="#e05550"/></svg>
-  <svg class="rsvp-arrow rsvp-arrow-3" viewBox="0 0 60 120" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><polygon points="30,120 10,80 25,80 25,0 35,0 35,80 50,80" fill="#e05550"/></svg>
-  <svg class="rsvp-arrow rsvp-arrow-4" viewBox="0 0 60 120" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><polygon points="30,120 10,80 25,80 25,0 35,0 35,80 50,80" fill="#e05550"/></svg>
-  <svg class="rsvp-arrow rsvp-arrow-5" viewBox="0 0 60 120" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><polygon points="30,120 10,80 25,80 25,0 35,0 35,80 50,80" fill="#e05550"/></svg>
-  <svg class="rsvp-arrow rsvp-arrow-6" viewBox="0 0 60 120" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><polygon points="30,120 10,80 25,80 25,0 35,0 35,80 50,80" fill="#e05550"/></svg>
-  <aside class="rsvp-box" aria-label="RSVP">
-    <h2>RSVP</h2>
-    <input type="email" placeholder="you@example.com" aria-label="Email" />
-    <button type="button">RSVP</button>
-    <label class="updates">
-      <input type="checkbox" checked />
-      <span>recieve email updates</span>
-    </label>
-    <p class="rsvp-note">
-      We will ask for an address to send the stickers to, Please use a real address or opt out since we send real stickers! You can always
-      <a href="https://hackclub.com/privacy-and-terms/" target="_blank" rel="noreferrer">view our privacy policy</a>.
-    </p>
-  </aside>
+  <div class="bottom-rsvp-inner">
+    <aside class="rsvp-box" aria-label="RSVP">
+      <h2>RSVP</h2>
+      <input type="email" placeholder="you@example.com" aria-label="Email" bind:value={bottomEmail} />
+      <button
+        type="button"
+        class="rsvp-btn"
+        class:valid={bottomValid}
+        class:sending={bottomStatus === 'sending'}
+        disabled={!bottomValid || bottomStatus === 'sending'}
+        onclick={() => submitRsvp(bottomEmail, (s) => bottomStatus = s)}
+      >
+        {#if bottomStatus === 'sending'}Sending...{:else}RSVP{/if}
+      </button>
+      {#if bottomStatus === 'error'}<p class="rsvp-error">Something went wrong, please try again.</p>{/if}
+      <label class="updates">
+        <input type="checkbox" bind:checked={bottomUpdates} />
+        <span>recieve email updates</span>
+      </label>
+      <p class="rsvp-note">
+        We will ask for an address to send the stickers to, Please use a real address or opt out since we send real stickers! You can always
+        <a href="https://hackclub.com/privacy-and-terms/" target="_blank" rel="noreferrer">view our privacy policy</a>.
+      </p>
+    </aside>
+    <div class="bottom-rsvp-text">
+      <h2>What Qualifies?</h2>
+      <p>Hack Club uses an in-house time tracking tool to measure and validate time spent on projects. <a href="https://hackatime.hackclub.com" target="_blank" rel="noreferrer">Hackatime</a> supports all major IDEs and text editors, but we also have <a href="https://lapse.hackclub.com" target="_blank" rel="noreferrer">Lapse</a> for recording timelapses of hardware projects.</p>
+      <p>A qualifying project can be anything you want, but it must meet the following conditions:</p>
+      <ul>
+        <li>Open Source Forever</li>
+        <li>Functional as laid out in project description</li>
+        <li>Included ReadMe.md</li>
+        <li>Accessible to any user without need of prior experience or setup</li>
+        <li>Time spent recorded faithfully through <a href="https://hackatime.hackclub.com" target="_blank" rel="noreferrer">Hackatime</a></li>
+      </ul>
+    </div>
+  </div>
 </section>
 
 <div class="rock-strata" style="background:#6c6659" aria-hidden="true">
@@ -386,6 +424,10 @@
       <a href="https://hackclub.com/privacy-and-terms/" target="_blank" rel="noreferrer">Privacy</a>
     </div>
   </div>
+  <p class="footer-love">made with &lt;3 by teens for teens</p>
+  <svg class="footer-cog" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" style="transform: rotate({scrollY * 0.1}deg)">
+    <g fill="#7f796d"><circle cx="50" cy="50" r="30"/>{#each Array(8) as _, t}<rect x="43" y="4" width="14" height="22" rx="3" transform="rotate({t*45} 50 50)"/>{/each}</g><circle cx="50" cy="50" r="12" fill="#000"/>
+  </svg>
 </footer>
 
 <style>
@@ -610,10 +652,6 @@
     height: 80px;
   }
 
-  .rock-strata--flip svg {
-    height: 80px;
-  }
-
   /* ── sign-up CTA ─────────────────────────────────── */
   .sticker-cta {
     display: flex;
@@ -636,22 +674,29 @@
   }
 
   .cta-sticker {
-    width: 360px;
-    height: 360px;
+    width: 380px;
+    height: 380px;
     flex-shrink: 0;
-    transform: rotate(10deg);
+    display: flex;
+    align-items: center;
+    justify-content: center;
     filter: drop-shadow(10px 12px 16px rgba(0, 0, 0, 0.45));
-    transition: transform 300ms ease;
+    animation: sticker-wiggle 3s ease-in-out infinite;
   }
 
   .cta-sticker:hover {
-    transform: rotate(4deg);
+    animation-play-state: paused;
+  }
+
+  @keyframes sticker-wiggle {
+    0%, 100% { transform: rotate(10deg); }
+    50% { transform: rotate(4deg); }
   }
 
   .cta-sticker img {
     display: block;
-    width: 100%;
-    height: 100%;
+    width: 85%;
+    height: 85%;
     object-fit: contain;
   }
 
@@ -663,41 +708,11 @@
   .cta-line {
     margin: 0;
     color: #e6f4fe;
-    font-family: "Courier New", monospace;
+    font-family: "Andale Mono", "Lucida Console", monospace;
     font-size: clamp(28px, 3.5vw, 52px);
     line-height: 1.15;
     letter-spacing: 0.03em;
     text-transform: uppercase;
-  }
-
-  .cta-line-right {
-    text-align: right;
-  }
-
-  .cta-line-with-arrow {
-    position: relative;
-    display: inline-block;
-  }
-
-  .cta-line-with-arrow .cta-line {
-    display: inline;
-  }
-
-  .cta-arrow {
-    flex-shrink: 0;
-    width: 100px;
-    height: 200px;
-  }
-
-  .cta-arrow-row {
-    display: flex;
-    align-items: flex-start;
-    gap: 12px;
-    margin-top: 4px;
-  }
-
-  .cta-door {
-    margin: 0;
   }
 
   .rainbow {
@@ -716,18 +731,6 @@
     80%  { color: #ffff00; }
     90%  { color: #e6f4fe; }
     100% { color: #e6f4fe; }
-  }
-
-  .section-divider {
-    height: 2px;
-    width: 80%;
-    margin: 0 auto;
-    background: linear-gradient(
-      to right,
-      transparent,
-      #cbc1ae 50%,
-      transparent
-    );
   }
 
   .strata-with-gears {
@@ -893,7 +896,35 @@
     font-weight: 700;
     letter-spacing: 0.04em;
     padding: 14px 12px;
+    cursor: not-allowed;
+    transition: background 0.25s, color 0.25s, transform 0.15s;
+  }
+
+  .rsvp-box button.valid {
+    background: #e05550;
+    color: #ffffff;
     cursor: pointer;
+  }
+
+  .rsvp-box button.valid:hover {
+    background: #d4918f;
+    transform: scale(1.03);
+  }
+
+  .rsvp-box button.valid:active {
+    transform: scale(0.97);
+  }
+
+  .rsvp-box button.sending {
+    background: #809fb7;
+    color: #ffffff;
+    cursor: wait;
+  }
+
+  .rsvp-error {
+    margin: 8px 0 0;
+    color: #e05550;
+    font-size: 14px;
   }
 
   .updates {
@@ -943,28 +974,6 @@
     object-fit: contain;
   }
 
-  /* Slight 3D settle: starts tilted, rotates into place on scroll. */
-  .v5 {
-    transform-origin: 20% 80%;
-    transform-style: preserve-3d;
-    transform: perspective(850px)
-      translate3d(
-        calc((1 - var(--s)) * -18px),
-        calc((1 - var(--s)) * 12px),
-        calc((1 - var(--s)) * 24px)
-      )
-      rotateX(calc((1 - var(--s)) * 16deg))
-      rotateY(calc((1 - var(--s)) * -14deg))
-      rotateZ(calc((1 - var(--s)) * -6deg));
-    filter: drop-shadow(
-      calc((1 - var(--s)) * 14px)
-      calc((1 - var(--s)) * 16px)
-      calc((1 - var(--s)) * 18px)
-      rgba(0, 0, 0, 0.45)
-    );
-    transition: transform 120ms linear, filter 120ms linear;
-    will-change: transform, filter;
-  }
 
   .callout {
     position: absolute;
@@ -1290,6 +1299,8 @@
 
   /* ── footer ──────────────────────────────────────── */
   .site-footer {
+    position: relative;
+    overflow: hidden;
     background: #000;
     padding: 48px 48px 40px;
     color: #7f796d;
@@ -1342,15 +1353,54 @@
     color: #cbc1ae;
   }
 
+  .footer-love {
+    margin: 32px 0 0;
+    font-size: 18px;
+    color: #7f796d;
+    text-align: left;
+  }
+
+  .footer-cog {
+    position: absolute;
+    bottom: -60px;
+    right: -60px;
+    width: 200px;
+    height: 200px;
+  }
+
   /* ── bottom RSVP ─────────────────────────────────── */
   /* ── hack club section ────────────────────────────── */
   .hackclub-section {
     background: #47453f;
+    padding: 96px 48px 0;
+  }
+
+  .hackclub-inner {
     display: flex;
     gap: 48px;
     max-width: 1196px;
     margin: 0 auto;
-    padding: 96px 48px 104px;
+  }
+
+  .faq-link {
+    width: 100%;
+    text-align: center;
+    color: #ddd7cf;
+    font-family: "Stone Breaker", "Courier New", monospace;
+    font-size: 36px;
+    letter-spacing: 0.04em;
+    padding: 48px 0;
+    margin: 0;
+    text-shadow: 0 2px 5px rgba(0, 0, 0, 0.55);
+  }
+
+  .faq-link a,
+  .faq-link a:visited {
+    color: #93b4cd;
+  }
+
+  .faq-link a:hover {
+    color: #e6f4fe;
   }
 
   .hackclub-text {
@@ -1444,45 +1494,76 @@
   /* ── bottom RSVP ─────────────────────────────────── */
   .bottom-rsvp {
     background: #6c6659;
-    display: flex;
-    justify-content: center;
-    align-items: center;
-    padding: 56px 48px 64px;
     position: relative;
     overflow: hidden;
+    padding: 56px 48px 64px;
   }
 
-  .rsvp-arrow {
-    position: absolute;
-    width: 75px;
-    height: 150px;
-    filter: drop-shadow(3px 4px 6px rgba(0, 0, 0, 0.4));
-    opacity: 1;
+  .bottom-rsvp-inner {
+    display: flex;
+    gap: 48px;
+    max-width: 1100px;
+    margin: 0 auto;
   }
 
-  /* top-right */
-  .rsvp-arrow-1 { top: 5%; right: 32%; transform: rotate(45deg); }
-  /* right */
-  .rsvp-arrow-2 { top: 50%; right: 27%; margin-top: -60px; transform: rotate(90deg); }
-  /* bottom-right */
-  .rsvp-arrow-3 { bottom: 5%; right: 32%; transform: rotate(135deg); }
-  /* top-left */
-  .rsvp-arrow-4 { top: 5%; left: 32%; transform: rotate(-45deg); }
-  /* left */
-  .rsvp-arrow-5 { top: 50%; left: 27%; margin-top: -60px; transform: rotate(-90deg); }
-  /* bottom-left */
-  .rsvp-arrow-6 { bottom: 5%; left: 32%; transform: rotate(-135deg); }
+  .bottom-rsvp-text {
+    flex: 1;
+    color: #e6f4fe;
+    font-family: "Courier New", monospace;
+  }
+
+  .bottom-rsvp-text h2 {
+    margin: 0 0 16px;
+    color: #ddd7cf;
+    font-family: "Stone Breaker", "Courier New", monospace;
+    font-size: clamp(22px, 2.4vw, 34px);
+    text-shadow: 0 2px 5px rgba(0, 0, 0, 0.55);
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+
+  .bottom-rsvp-text p {
+    margin: 0 0 12px;
+    color: #ddd7cf;
+    font-family: "Sunny Mood", "Courier New", monospace;
+    font-size: clamp(15px, 1.4vw, 19px);
+    line-height: 1.55;
+    text-shadow: 0 2px 5px rgba(0, 0, 0, 0.55);
+  }
+
+  .bottom-rsvp-text ul {
+    margin: 0;
+    padding-left: 20px;
+    color: #ddd7cf;
+    font-family: "Sunny Mood", "Courier New", monospace;
+    font-size: clamp(15px, 1.4vw, 19px);
+    line-height: 1.75;
+    text-shadow: 0 2px 5px rgba(0, 0, 0, 0.55);
+  }
+
+  .bottom-rsvp-text a,
+  .bottom-rsvp-text a:visited {
+    color: #93b4cd;
+    text-decoration: underline;
+  }
+
+  .bottom-rsvp-text a:hover {
+    color: #e6f4fe;
+  }
 
   .bottom-rsvp .rsvp-box {
-    width: 100%;
-    max-width: 480px;
+    flex: 0 0 380px;
+    align-self: flex-start;
     z-index: 1;
   }
 
   @media (max-width: 900px) {
     .hackclub-section {
+      padding: 40px 20px 0;
+    }
+
+    .hackclub-inner {
       flex-direction: column;
-      padding: 40px 20px 48px;
     }
 
     .hackclub-photos {
@@ -1498,8 +1579,6 @@
       width: 300px;
       height: 220px;
     }
-
-    .rsvp-arrow { display: none; }
 
     .bottom-rsvp {
       padding: 40px 20px 48px;

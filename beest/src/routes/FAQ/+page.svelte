@@ -1,66 +1,354 @@
-<!-- src/routes/+page.svelte -->
- <!-- Color Pallet
-  #c48382 - Light Red
-  #93b4cd - Light Blue
-  #4b4840 - Dark Gray
-  #6c6659 - Medium Gray
-  #7f796d - Light Gray
-  #cbc1ae - Beige
-  #809fb7 - Light Steel Blue
-  #e6f4fe - Light Cyan
-  #ffffff - White
- 
- -->
+<!-- src/routes/FAQ/+page.svelte -->
+<!-- Color Pallet
+ #c48382 - Light Red
+ #93b4cd - Light Blue
+ #4b4840 - Dark Gray
+ #6c6659 - Medium Gray
+ #7f796d - Light Gray
+ #cbc1ae - Beige
+ #809fb7 - Light Steel Blue
+ #e6f4fe - Light Cyan
+ #ffffff - White
+-->
 
+<script lang="ts">
+  import { resolve } from '$app/paths';
 
+  let scrollY = $state(0);
+  let openIndex = $state<number | null>(null);
 
-<div class="page-wrap">
+  function toggle(i: number) {
+    openIndex = openIndex === i ? null : i;
+  }
 
+  const faqs = [
+    {
+      q: 'What is Beest?',
+      a: 'Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris.'
+    },
+    {
+      q: 'Who can participate?',
+      a: 'Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident.'
+    },
+    {
+      q: 'How much does it cost?',
+      a: 'Ut enim ad minima veniam, quis nostrum exercitationem ullam corporis suscipit laboriosam, nisi ut aliquid ex ea commodi consequatur.'
+    },
+    {
+      q: 'Where and when does Beest take place?',
+      a: 'Nemo enim ipsam voluptatem quia voluptas sit aspernatur aut odit aut fugit, sed quia consequuntur magni dolores eos qui ratione voluptatem sequi nesciunt.'
+    },
+    {
+      q: 'What should I bring?',
+      a: 'Quis autem vel eum iure reprehenderit qui in ea voluptate velit esse quam nihil molestiae consequatur, vel illum qui dolorem eum fugiat.'
+    },
+    {
+      q: 'Do I need prior engineering or building experience?',
+      a: 'At vero eos et accusamus et iusto odio dignissimos ducimus qui blanditiis praesentium voluptatum deleniti atque corrupti quos dolores.'
+    },
+    {
+      q: 'What is a Strandbeest?',
+      a: 'Temporibus autem quibusdam et aut officiis debitis aut rerum necessitatibus saepe eveniet ut et voluptates repudiandae sint et molestiae non recusandae.'
+    },
+    {
+      q: 'How do I RSVP?',
+      a: 'Itaque earum rerum hic tenetur a sapiente delectus, ut aut reiciendis voluptatibus maiores alias consequatur aut perferendis doloribus asperiores repellat.'
+    },
+    {
+      q: 'I have more questions — how do I get in touch?',
+      a: 'Nam libero tempore, cum soluta nobis est eligendi optio cumque nihil impedit quo minus id quod maxime placeat facere possimus, omnis voluptas assumenda est.'
+    }
+  ];
+</script>
 
-<div class="top-bg">
-<img src="/images/FAQ-Header.webp" alt="Hero" class="hero-image" loading="eager" decoding="async" />
+<svelte:window bind:scrollY={scrollY} />
 
-</div>
-<div>
-<h1>Frequently Asked Questions</h1>
-<p>Here are some of the most common questions we receive about Beest. If you have
-any other questions, feel free to reach out to us! We have a dedicated help channel in the slack, but if aren't on slack you can email euan@hackclub.com</p>
-</div>
+<div class="faq-page">
+  <!-- Side gears — desktop only, half-embedded into edges -->
+  <svg class="side-gear side-gear-l1" style="transform: rotate({scrollY * 0.08}deg)" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+    <g fill="#6c6659"><circle cx="50" cy="50" r="30"/>{#each Array(8) as _, t (t)}<rect x="43" y="4" width="14" height="22" rx="3" transform="rotate({t*45} 50 50)"/>{/each}</g><circle cx="50" cy="50" r="12" fill="#4b4840"/>
+  </svg>
+  <svg class="side-gear side-gear-l2" style="transform: rotate({-scrollY * 0.08 + 22.5}deg)" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+    <g fill="#7f796d"><circle cx="50" cy="50" r="30"/>{#each Array(8) as _, t (t)}<rect x="43" y="4" width="14" height="22" rx="3" transform="rotate({t*45} 50 50)"/>{/each}</g><circle cx="50" cy="50" r="12" fill="#4b4840"/>
+  </svg>
+  <svg class="side-gear side-gear-l3" style="transform: rotate({scrollY * 0.06}deg)" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+    <g fill="#6c6659"><circle cx="50" cy="50" r="30"/>{#each Array(8) as _, t (t)}<rect x="43" y="4" width="14" height="22" rx="3" transform="rotate({t*45} 50 50)"/>{/each}</g><circle cx="50" cy="50" r="12" fill="#4b4840"/>
+  </svg>
 
+  <svg class="side-gear side-gear-r1" style="transform: rotate({-scrollY * 0.08}deg)" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+    <g fill="#6c6659"><circle cx="50" cy="50" r="30"/>{#each Array(8) as _, t (t)}<rect x="43" y="4" width="14" height="22" rx="3" transform="rotate({t*45} 50 50)"/>{/each}</g><circle cx="50" cy="50" r="12" fill="#4b4840"/>
+  </svg>
+  <svg class="side-gear side-gear-r2" style="transform: rotate({scrollY * 0.08 + 22.5}deg)" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+    <g fill="#7f796d"><circle cx="50" cy="50" r="30"/>{#each Array(8) as _, t (t)}<rect x="43" y="4" width="14" height="22" rx="3" transform="rotate({t*45} 50 50)"/>{/each}</g><circle cx="50" cy="50" r="12" fill="#4b4840"/>
+  </svg>
+  <svg class="side-gear side-gear-r3" style="transform: rotate({-scrollY * 0.06}deg)" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+    <g fill="#6c6659"><circle cx="50" cy="50" r="30"/>{#each Array(8) as _, t (t)}<rect x="43" y="4" width="14" height="22" rx="3" transform="rotate({t*45} 50 50)"/>{/each}</g><circle cx="50" cy="50" r="12" fill="#4b4840"/>
+  </svg>
 
+  <h1>Frequently Asked Questions</h1>
+  <p class="faq-intro">Got questions about Beest? We've got answers. If you need more help, hop into the Beest channel on Hack Club Slack or email euan@hackclub.com</p>
 
+  <div class="faq-list">
+    {#each faqs as faq, i (faq.q)}
+      <button
+        class="faq-item"
+        class:open={openIndex === i}
+        onclick={() => toggle(i)}
+        aria-expanded={openIndex === i}
+      >
+        <div class="faq-question">
+          <span>{faq.q}</span>
+          <span class="faq-icon" class:rotated={openIndex === i}>+</span>
+        </div>
+        {#if openIndex === i}
+          <div class="faq-answer">
+            <p>{faq.a}</p>
+          </div>
+        {/if}
+      </button>
+    {/each}
+  </div>
 
-
-
-
-
-
-
+  <a href={resolve('/')} class="back-btn">Back to main site</a>
 </div>
 
 <style>
-  .top-bg {
-    background: #e7a285;
+  @font-face {
+    font-family: "Stone Breaker";
+    src: url("/fonts/Stone Breaker.woff2") format("woff2");
+    font-weight: normal;
+    font-style: normal;
+    font-display: swap;
   }
 
-  /* ── decorative pipes ───────────────────────────── */
-  .page-wrap {
-    position: relative;
-    overflow-x: clip;
-  }
-
-  .hero-image {
-    display: block;
-    width: 100%;
-    height: auto;
-    border: none;
+  @font-face {
+    font-family: "Sunny Mood";
+    src: url("/fonts/SunnyMood.woff2") format("woff2");
+    font-weight: normal;
+    font-style: normal;
+    font-display: swap;
   }
 
   :global(body) {
     margin: 0;
     padding: 0;
-    background-color: #e7a285;
+    background-color: #4b4840;
     filter: saturate(1.5);
   }
 
+  .faq-page {
+    background: #4b4840;
+    min-height: 100vh;
+    padding: 4rem 1.5rem;
+    position: relative;
+    overflow-x: clip;
+  }
+
+  .faq-page::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background: url('/images/tile.webp') repeat;
+    opacity: 0.06;
+    mix-blend-mode: overlay;
+    pointer-events: none;
+  }
+
+  .faq-page > * {
+    position: relative;
+    z-index: 1;
+  }
+
+  h1 {
+    font-family: "Stone Breaker", "Courier New", monospace;
+    color: #cbc1ae;
+    font-size: 3rem;
+    text-align: center;
+    margin: 0 0 1rem;
+  }
+
+  .faq-intro {
+    font-family: "Courier New", monospace;
+    color: #cbc1ae;
+    text-align: center;
+    max-width: 600px;
+    margin: 0 auto 2.5rem;
+    font-size: 1.05rem;
+    line-height: 1.6;
+    opacity: 0.85;
+  }
+
+  .faq-list {
+    max-width: 720px;
+    margin: 0 auto;
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+  }
+
+  .faq-item {
+    background: #3a3530;
+    border: 2px solid #2e2a26;
+    border-radius: 8px;
+    padding: 0;
+    cursor: pointer;
+    text-align: left;
+    width: 100%;
+    font-family: inherit;
+    color: inherit;
+    transition: background 0.2s, box-shadow 0.2s;
+    box-shadow:
+      0 4px 8px rgba(0, 0, 0, 0.3),
+      0 8px 20px rgba(0, 0, 0, 0.25);
+  }
+
+  .faq-item:hover {
+    background: #4b4840;
+    box-shadow:
+      0 6px 12px rgba(0, 0, 0, 0.35),
+      0 12px 28px rgba(0, 0, 0, 0.3);
+  }
+
+  .faq-item.open {
+    background: #3a3530;
+    border-color: #cbc1ae;
+    box-shadow:
+      0 8px 16px rgba(0, 0, 0, 0.4),
+      0 16px 36px rgba(0, 0, 0, 0.3);
+  }
+
+  .faq-question {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 1rem 1.25rem;
+    font-family: "Sunny Mood", "Courier New", monospace;
+    font-size: 1.2rem;
+    color: #e6e2da;
+    gap: 1rem;
+  }
+
+  .faq-icon {
+    font-family: "Courier New", monospace;
+    font-size: 1.5rem;
+    color: #e6e2da;
+    flex-shrink: 0;
+    transition: transform 0.25s ease;
+    line-height: 1;
+  }
+
+  .faq-icon.rotated {
+    transform: rotate(45deg);
+  }
+
+  .faq-answer {
+    padding: 0 1.25rem 1rem;
+  }
+
+  .faq-answer p {
+    font-family: "Courier New", monospace;
+    color: #e6e2da;
+    font-size: 0.9rem;
+    line-height: 1.7;
+    margin: 0;
+  }
+
+  .back-btn {
+    display: block;
+    width: fit-content;
+    margin: 2.5rem auto 0;
+    padding: 0.75rem 2rem;
+    font-family: "Stone Breaker", "Courier New", monospace;
+    font-size: 1.3rem;
+    color: #e6e2da;
+    background: #3a3530;
+    border: 2px solid #2e2a26;
+    border-radius: 8px;
+    text-decoration: none;
+    text-align: center;
+    transition: background 0.2s;
+    box-shadow:
+      0 4px 8px rgba(0, 0, 0, 0.3),
+      0 8px 20px rgba(0, 0, 0, 0.25);
+  }
+
+  .back-btn:hover {
+    background: #4b4840;
+  }
+
+  .side-gear {
+    position: absolute;
+    z-index: 3;
+    pointer-events: none;
+    width: 200px;
+    height: 200px;
+  }
+
+  /* Left side gears — half off the left edge */
+  .side-gear-l1 {
+    left: -90px;
+    top: 10%;
+  }
+
+  .side-gear-l2 {
+    left: -100px;
+    top: 40%;
+    width: 240px;
+    height: 240px;
+  }
+
+  .side-gear-l3 {
+    left: -90px;
+    top: 72%;
+  }
+
+  /* Right side gears — half off the right edge */
+  .side-gear-r1 {
+    right: -90px;
+    top: 20%;
+  }
+
+  .side-gear-r2 {
+    right: -100px;
+    top: 53%;
+    width: 240px;
+    height: 240px;
+  }
+
+  .side-gear-r3 {
+    right: -90px;
+    top: 80%;
+  }
+
+  @media (max-width: 600px) {
+    .side-gear {
+      display: none;
+    }
+    h1 {
+      font-size: 2rem;
+    }
+
+    .faq-intro {
+      font-size: 0.95rem;
+    }
+
+    .faq-page {
+      padding: 2.5rem 1rem;
+    }
+
+    .faq-question {
+      font-size: 1rem;
+      padding: 0.85rem 1rem;
+    }
+
+    .faq-answer {
+      padding: 0 1rem 0.85rem;
+    }
+
+    .faq-item {
+      box-shadow:
+        0 2px 4px rgba(0, 0, 0, 0.25),
+        0 4px 10px rgba(0, 0, 0, 0.2);
+    }
+  }
 </style>

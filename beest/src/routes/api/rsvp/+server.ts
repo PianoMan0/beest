@@ -16,7 +16,7 @@ export const POST: RequestHandler = async ({ request }) => {
 		return json({ error: 'Invalid JSON' }, { status: 400 });
 	}
 
-	const { email: rawEmail, updates } = body as { email?: string; updates?: boolean };
+	const { email: rawEmail } = body as { email?: string };
 
 	if (!rawEmail || typeof rawEmail !== 'string') {
 		return json({ error: 'Email is required' }, { status: 400 });
@@ -38,8 +38,7 @@ export const POST: RequestHandler = async ({ request }) => {
 			records: [
 				{
 					fields: {
-						Email: email,
-						Updates: typeof updates === 'boolean' ? updates : true
+						Email: email
 					}
 				}
 			]

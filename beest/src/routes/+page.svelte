@@ -474,7 +474,7 @@
   /* ── decorative pipes ───────────────────────────── */
   .page-wrap {
     position: relative;
-    overflow-x: clip;
+    overflow-x: hidden;
   }
 
   .pipe {
@@ -1092,7 +1092,7 @@
 
   .carousel-section {
     position: relative;
-    overflow-x: clip;
+    overflow-x: hidden;
     overflow-y: visible;
     padding: 80px 0 80px;
     display: grid;
@@ -1152,10 +1152,8 @@
     animation: shop-scroll-right 46s linear infinite;
   }
 
-  .carousel-section:has(.shop-carousel:hover) .carousel-belt,
-  .carousel-section:has(.shop-carousel:hover) .carousel-belt-bg,
-  .carousel-section:has(.shop-carousel-bg:hover) .carousel-belt,
-  .carousel-section:has(.shop-carousel-bg:hover) .carousel-belt-bg {
+  .carousel-section:hover .carousel-belt,
+  .carousel-section:hover .carousel-belt-bg {
     animation-play-state: paused;
   }
 

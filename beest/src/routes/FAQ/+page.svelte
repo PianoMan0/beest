@@ -41,7 +41,7 @@
     },
     {
       q: 'How do I qualify?',
-      a: 'Build an open source coding or hardware project! Anything you can dream up is possible, just make the project you want to exist. Please don't AI generate the project, instead focus on making something fun, silly, useful to you or a project that forces you to learn something new. 40 hours of tracked work will automatically qualify you, and working for additional hours will contribute $10/hr toward your flight cost or visa application fees.'
+      a: 'Build an open source coding or hardware project! Anything you can dream up is possible, just make the project you want to exist. Please don\'t AI generate the project, instead focus on making something fun, silly, useful to you or a project that forces you to learn something new. 40 hours of tracked work will automatically qualify you, and working for additional hours will contribute $10/hr toward your flight cost or visa application fees.'
     },
     {
       q: 'What should I bring?',
@@ -142,7 +142,7 @@
     min-height: 100vh;
     padding: 4rem 1.5rem;
     position: relative;
-    overflow-x: clip;
+    overflow-x: hidden;
   }
 
   .faq-page::after {

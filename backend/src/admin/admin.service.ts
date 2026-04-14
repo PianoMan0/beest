@@ -1,0 +1,766 @@
+import {
+  Injectable,
+  BadRequestException,
+  Logger,
+  NotFoundException,
+} from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { InjectRepository } from '@nestjs/typeorm';
+import { Repository } from 'typeorm';
+import { User } from '../entities/user.entity';
+import { Session } from '../entities/session.entity';
+import { Project } from '../entities/project.entity';
+import { AuditLog } from '../entities/audit-log.entity';
+import { NewsItem } from '../entities/news-item.entity';
+import { ProjectReview } from '../entities/project-review.entity';
+import { ShopItem } from '../entities/shop-item.entity';
+import { Order } from '../entities/order.entity';
+import { Submission } from '../entities/submission.entity';
+import { RsvpService } from '../rsvp/rsvp.service';
+import { AuditLogService } from '../audit-log/audit-log.service';
+import { fetchWithTimeout } from '../fetch.util';
+
+const VALID_PERMS = [
+  'User',
+  'Helper',
+  'Reviewer',
+  'Fraud Reviewer',
+  'Super Admin',
+  'Banned',
+] as const;
+
+@Injectable()
+export class AdminService {
+  private readonly logger = new Logger(AdminService.name);
+  private readonly hackatimeBaseUrl: string;
+  private readonly hackatimeAdminKey: string | undefined;
+  private readonly unifiedApiKey: string | undefined;
+  private readonly unifiedBaseId = 'app3A5kJwYqxMLOgh';
+
+  constructor(
+    private readonly configService: ConfigService,
+    @InjectRepository(User) private readonly userRepo: Repository<User>,
+    @InjectRepository(Session) private readonly sessionRepo: Repository<Session>,
+    @InjectRepository(Project) private readonly projectRepo: Repository<Project>,
+    @InjectRepository(AuditLog) private readonly auditLogRepo: Repository<AuditLog>,
+    @InjectRepository(NewsItem) private readonly newsRepo: Repository<NewsItem>,
+    @InjectRepository(ProjectReview) private readonly reviewRepo: Repository<ProjectReview>,
+    @InjectRepository(ShopItem) private readonly shopRepo: Repository<ShopItem>,
+    @InjectRepository(Order) private readonly orderRepo: Repository<Order>,
+    @InjectRepository(Submission) private readonly submissionRepo: Repository<Submission>,
+    private readonly rsvpService: RsvpService,
+    private readonly auditLogService: AuditLogService,
+  ) {
+    this.hackatimeBaseUrl = this.configService.get(
+      'HACKATIME_BASE_URL',
+      'https://hackatime.hackclub.com',
+    );
+    this.hackatimeAdminKey = this.configService.get('HACKATIME_ADMIN_API_KEY');
+    if (!this.hackatimeAdminKey) {
+      this.logger.warn('HACKATIME_ADMIN_API_KEY not set — admin Hackatime lookups disabled');
+    }
+    this.unifiedApiKey = this.configService.get('UNIFIED_API_KEY');
+  }
+
+  async listUsers(): Promise<any[]> {
+    const [users, permsMap] = await Promise.all([
+      this.userRepo.find({ order: { createdAt: 'DESC' } }),
+      this.rsvpService.getAllPerms(),
+    ]);
+    return users.map((u) => ({
+      id: u.id,
+      hcaSub: u.hcaSub,
+      name: u.name,
+      nickname: u.nickname,
+      slackId: u.slackId,
+      email: u.email,
+      hackatimeConnected: !!u.hackatimeToken,
+      perms: (u.email ? permsMap.get(u.email.toLowerCase()) : null) ?? null,
+      createdAt: u.createdAt,
+    }));
+  }
+
+  async getUser(userId: string) {
+    const user = await this.userRepo.findOne({
+      where: { id: userId },
+    });
+    if (!user) throw new NotFoundException('User not found');
+
+    const projects = await this.projectRepo.find({
+      where: { userId },
+      order: { createdAt: 'DESC' },
+      select: ['id', 'name', 'status', 'projectType', 'createdAt'],
+    });
+
+    const orders = await this.orderRepo.find({
+      where: { userId },
+      order: { createdAt: 'DESC' },
+      select: ['id', 'itemName', 'quantity', 'pipesSpent', 'status', 'createdAt'],
+    });
+
+    const sessions = await this.sessionRepo.count({ where: { userId } });
+
+    const auditLogs = await this.auditLogRepo.find({
+      where: { userId },
+      order: { createdAt: 'DESC' },
+      take: 50,
+      select: ['id', 'action', 'label', 'createdAt'],
+    });
+
+    let perms: string | null = null;
+    try {
+      if (user.email) {
+        perms = await this.rsvpService.getPerms(user.email);
+      }
+    } catch {
+      // Airtable lookup failed — don't block the response
+    }
+
+    return {
+      id: user.id,
+      hcaSub: user.hcaSub,
+      name: user.name,
+      nickname: user.nickname,
+      slackId: user.slackId,
+      email: user.email,
+      hackatimeConnected: !!user.hackatimeToken,
+      twoEmails: user.twoEmails,
+      createdAt: user.createdAt,
+      updatedAt: user.updatedAt,
+      pipes: user.pipes ?? 0,
+      perms,
+      projects,
+      orders,
+      activeSessions: sessions,
+      auditLogs,
+    };
+  }
+
+  async banUser(userId: string, adminId?: string): Promise<void> {
+    const user = await this.userRepo.findOne({ where: { id: userId } });
+    if (!user) throw new NotFoundException('User not found');
+
+    // 1. Update Airtable perms to Banned
+    await this.rsvpService.updatePerms(user.email, 'Banned');
+
+    // 2. Revoke all sessions for this user
+    await this.sessionRepo.delete({ userId });
+
+    // 3. Audit log on the banned user's record
+    const identifier = user.name || user.slackId || user.hcaSub;
+    await this.auditLogService.log(userId, 'admin_ban', `Banned user ${identifier}`);
+
+    // 4. Audit log on the admin's record
+    if (adminId) {
+      await this.auditLogService.log(adminId, 'admin_ban', `Banned user ${identifier}`);
+    }
+  }
+
+  async banAndRejectProject(
+    projectId: string,
+    reviewerId: string,
+    feedback: string | null,
+    internalNote: string | null,
+    overrideJustification: string | null,
+  ) {
+    const project = await this.projectRepo.findOne({
+      where: { id: projectId },
+      relations: ['user'],
+    });
+    if (!project) throw new NotFoundException('Project not found');
+
+    // 1. Reject the project
+    project.status = 'changes_needed';
+    await this.projectRepo.save(project);
+
+    // 2. Save review record
+    const review = this.reviewRepo.create({
+      projectId,
+      reviewerId,
+      status: 'ban',
+      feedback: feedback || null,
+      internalNote: internalNote || null,
+      overrideJustification: overrideJustification || null,
+    });
+    await this.reviewRepo.save(review);
+
+    // 3. Ban the user
+    await this.banUser(project.userId);
+
+    // 4. Audit logs
+    await this.auditLogService.log(project.userId, 'project_reviewed', `Project "${project.name}" was rejected`);
+    await this.auditLogService.log(project.userId, 'admin_ban', `Banned via project review of "${project.name}"`);
+
+    return { success: true };
+  }
+
+  async updatePerms(userId: string, perms: string, adminId?: string): Promise<void> {
+    if (!VALID_PERMS.includes(perms as any)) {
+      throw new BadRequestException(
+        `Invalid perms value. Must be one of: ${VALID_PERMS.join(', ')}`,
+      );
+    }
+
+    const user = await this.userRepo.findOne({ where: { id: userId } });
+    if (!user) throw new NotFoundException('User not found');
+
+    await this.rsvpService.updatePerms(user.email, perms);
+
+    const identifier = user.name || user.slackId || user.hcaSub;
+    await this.auditLogService.log(userId, 'admin_perms_change', `Changed ${identifier} perms to ${perms}`);
+
+    if (adminId) {
+      await this.auditLogService.log(adminId, 'admin_perms_change', `Changed ${identifier} perms to ${perms}`);
+    }
+  }
+
+  // ── Projects ──
+
+  async listAllProjects() {
+    const projects = await this.projectRepo.find({
+      order: { createdAt: 'DESC' },
+      relations: ['user'],
+    });
+
+    const statusCounts = {
+      unshipped: 0,
+      unreviewed: 0,
+      changes_needed: 0,
+      approved: 0,
+    };
+
+    // Fetch latest submission for each project in a single query
+    const latestSubmissions = await this.submissionRepo
+      .createQueryBuilder('s')
+      .distinctOn(['s.project_id'])
+      .orderBy('s.project_id')
+      .addOrderBy('s.created_at', 'DESC')
+      .getMany();
+    const submissionMap = new Map(latestSubmissions.map((s) => [s.projectId, s]));
+
+    const mapped = projects.map((p) => {
+      if (p.status in statusCounts) {
+        statusCounts[p.status as keyof typeof statusCounts]++;
+      }
+      const latestSub = submissionMap.get(p.id);
+      return {
+        id: p.id,
+        name: p.name,
+        description: p.description,
+        projectType: p.projectType,
+        status: p.status,
+        codeUrl: p.codeUrl,
+        demoUrl: p.demoUrl,
+        readmeUrl: p.readmeUrl,
+        screenshot1Url: p.screenshot1Url,
+        screenshot2Url: p.screenshot2Url,
+        hackatimeProjectName: p.hackatimeProjectName,
+        isUpdate: p.isUpdate,
+        otherHcProgram: p.otherHcProgram,
+        aiUse: p.aiUse,
+        createdAt: p.createdAt,
+        updatedAt: p.updatedAt,
+        user: {
+          id: p.user?.id,
+          name: p.user?.name,
+          slackId: p.user?.slackId,
+        },
+        latestSubmission: latestSub ? {
+          id: latestSub.id,
+          changeDescription: latestSub.changeDescription,
+          minHoursConfirmed: latestSub.minHoursConfirmed,
+          status: latestSub.status,
+          createdAt: latestSub.createdAt,
+        } : null,
+      };
+    });
+
+    return { statusCounts, projects: mapped };
+  }
+
+  async reviewProject(
+    projectId: string,
+    reviewerId: string,
+    status: string,
+    feedback: string | null,
+    internalNote: string | null,
+    overrideJustification: string | null,
+    overrideHours: number | null,
+    internalHours: number | null,
+  ) {
+    const project = await this.projectRepo.findOne({
+      where: { id: projectId },
+      relations: ['user'],
+    });
+    if (!project) throw new NotFoundException('Project not found');
+
+    // Find the latest unreviewed submission for this project
+    const submission = await this.submissionRepo.findOne({
+      where: { projectId, status: 'unreviewed' },
+      order: { createdAt: 'DESC' },
+    });
+
+    // 1. Update project status and hours
+    project.status = status;
+    if (overrideHours !== null && overrideHours !== undefined) {
+      project.overrideHours = Math.round(overrideHours * 10) / 10;
+    }
+    if (internalHours !== null && internalHours !== undefined) {
+      project.internalHours = Math.round(internalHours * 10) / 10;
+    }
+    await this.projectRepo.save(project);
+
+    // 2. Grant pipes as delta on this submission
+    //    Pipes granted = overrideHours for THIS submission minus what was already granted on previous submissions.
+    //    The project's pipesGranted tracks the cumulative total.
+    if (status === 'approved' && project.overrideHours != null && project.overrideHours > 0) {
+      const totalPipesTarget = Math.floor(project.overrideHours);
+      const previouslyGranted = project.pipesGranted ?? 0;
+      const delta = totalPipesTarget - previouslyGranted;
+      if (delta > 0) {
+        await this.userRepo.increment({ id: project.userId }, 'pipes', delta);
+        project.pipesGranted = totalPipesTarget;
+        await this.projectRepo.save(project);
+
+        // Track what this submission granted
+        if (submission) {
+          submission.pipesGranted = delta;
+        }
+      }
+    }
+
+    // 3. Update the submission status and hours
+    if (submission) {
+      submission.status = status;
+      if (overrideHours !== null && overrideHours !== undefined) {
+        submission.overrideHours = Math.round(overrideHours * 10) / 10;
+      }
+      if (internalHours !== null && internalHours !== undefined) {
+        submission.internalHours = Math.round(internalHours * 10) / 10;
+      }
+      await this.submissionRepo.save(submission);
+    }
+
+    // 4. Save the review record (linked to submission if one exists)
+    const review = this.reviewRepo.create({
+      projectId,
+      reviewerId,
+      submissionId: submission?.id ?? null,
+      status,
+      feedback: feedback || null,
+      internalNote: internalNote || null,
+      overrideJustification: overrideJustification || null,
+    });
+    await this.reviewRepo.save(review);
+
+    // 5. Audit log to the project owner (not the reviewer)
+    const label =
+      status === 'approved'
+        ? `Project "${project.name}" was approved`
+        : `Project "${project.name}" received feedback`;
+    await this.auditLogService.log(project.userId, 'project_reviewed', label);
+
+    // 6. Sync approval date to Airtable for Loops
+    if (status === 'approved' && project.user?.email) {
+      this.rsvpService.updateDateField(project.user.email, 'Loops - beestApprovedProject');
+    }
+
+    return { success: true };
+  }
+
+  async getProjectReviews(projectId: string, includeInternal: boolean) {
+    const reviews = await this.reviewRepo.find({
+      where: { projectId },
+      order: { createdAt: 'DESC' },
+      relations: ['reviewer'],
+    });
+
+    return reviews.map((r) => ({
+      id: r.id,
+      status: r.status,
+      feedback: r.feedback,
+      ...(includeInternal ? { internalNote: r.internalNote } : {}),
+      overrideJustification: r.overrideJustification,
+      reviewerName: r.reviewer?.name ?? null,
+      createdAt: r.createdAt,
+    }));
+  }
+
+  // ── Unified Airtable duplicate check ──
+
+  /**
+   * Checks the Unified Airtable "Approved Projects" table for a matching Code URL.
+   *
+   * Security constraints:
+   * - This method is private — only callable within AdminService
+   * - Only called from getProjectHackatime, which is behind SuperAdminGuard
+   * - Only accepts HTTPS URLs (rejects anything else)
+   * - The codeUrl is taken from the project's DB record, never from user input
+   * - Returns only boolean match/error — no Airtable record data is ever exposed
+   */
+  private async checkUnifiedDuplicate(
+    codeUrl: string,
+  ): Promise<{ duplicate: boolean; error: boolean }> {
+    if (!this.unifiedApiKey || !codeUrl) {
+      return { duplicate: false, error: true };
+    }
+
+    // Only allow https:// URLs — reject anything that could be a formula injection
+    try {
+      const parsed = new URL(codeUrl);
+      if (parsed.protocol !== 'https:') {
+        return { duplicate: false, error: true };
+      }
+    } catch {
+      return { duplicate: false, error: true };
+    }
+
+    // Escape for Airtable formula: double any backslashes, then escape single quotes
+    const escaped = codeUrl.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+    const formula = `{Code URL} = '${escaped}'`;
+
+    try {
+      const params = new URLSearchParams({
+        filterByFormula: formula,
+        maxRecords: '1',
+        'fields[]': 'Code URL',
+      });
+      const url = `https://api.airtable.com/v0/${this.unifiedBaseId}/Approved%20Projects?${params}`;
+      this.logger.log(`Unified check: formula=${formula}`);
+      const res = await fetchWithTimeout(url, {
+        headers: { Authorization: `Bearer ${this.unifiedApiKey}` },
+      });
+      if (!res.ok) {
+        const body = await res.text();
+        this.logger.warn(`Unified check failed (${res.status}): ${body}`);
+        return { duplicate: false, error: true };
+      }
+      const data = await res.json();
+      const records: any[] = data?.records ?? [];
+      this.logger.log(`Unified check: ${records.length} records found`);
+      // Only expose match/no-match — never leak record contents
+      return { duplicate: records.length > 0, error: false };
+    } catch {
+      return { duplicate: false, error: true };
+    }
+  }
+
+  // ── Hackatime admin lookup ──
+
+  private emptyHackatimeResult(projectId: string, user: User | null) {
+    return {
+      projectId,
+      hackatimeProjects: [],
+      totalHours: 0,
+      earliestHeartbeat: null,
+      previousApprovedHours: 0,
+      trustLevel: null,
+      linkedBanned: false,
+      linkedEmail: null,
+      linkedSlackUid: null,
+      beestEmail: user?.email ?? null,
+      beestSlackId: user?.slackId ?? null,
+      emailMismatch: false,
+      unifiedDuplicate: false,
+      unifiedError: true,
+    };
+  }
+
+  private async hackatimeGet(path: string): Promise<Response> {
+    return fetchWithTimeout(`${this.hackatimeBaseUrl}${path}`, {
+      headers: { Authorization: `Bearer ${this.hackatimeAdminKey}` },
+    });
+  }
+
+  private async hackatimePost(path: string, body: object): Promise<Response> {
+    return fetchWithTimeout(`${this.hackatimeBaseUrl}${path}`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${this.hackatimeAdminKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(body),
+    });
+  }
+
+  async getProjectHackatime(projectId: string) {
+    if (!this.hackatimeAdminKey) {
+      throw new BadRequestException('Hackatime admin API key not configured');
+    }
+
+    const project = await this.projectRepo.findOne({
+      where: { id: projectId },
+      relations: ['user'],
+    });
+    if (!project) throw new NotFoundException('Project not found');
+
+    const hackatimeNames: string[] = project.hackatimeProjectName ?? [];
+    const user = project.user;
+    if (!user) {
+      return this.emptyHackatimeResult(projectId, user);
+    }
+
+    try {
+      // 1. Resolve Hackatime user ID — prefer stored ID, fall back to email lookup, then OAuth token
+      let hackatimeUserId: string | number | null = user.hackatimeUserId ?? null;
+      if (!hackatimeUserId && user.email) {
+        try {
+          const emailRes = await this.hackatimePost(
+            '/api/admin/v1/user/get_user_by_email',
+            { email: user.email },
+          );
+          if (emailRes.ok) {
+            const emailData = await emailRes.json();
+            hackatimeUserId = emailData.user_id ?? emailData?.data?.user_id ?? null;
+          }
+        } catch (err) {
+          this.logger.warn(`Hackatime email lookup failed for project ${projectId}: ${err}`);
+        }
+      }
+      // Last resort: use the user's own Hackatime OAuth token to resolve their ID
+      if (!hackatimeUserId && user.hackatimeToken) {
+        try {
+          const meRes = await fetchWithTimeout(
+            `${this.hackatimeBaseUrl}/api/v1/authenticated/me`,
+            { headers: { Authorization: `Bearer ${user.hackatimeToken}` } },
+          );
+          if (meRes.ok) {
+            const meData = await meRes.json();
+            const d = meData?.data ?? meData;
+            hackatimeUserId = d?.id?.toString() ?? d?.user_id?.toString() ?? null;
+            // Persist for future lookups
+            if (hackatimeUserId) {
+              user.hackatimeUserId = String(hackatimeUserId);
+              await this.userRepo.save(user);
+            }
+          }
+        } catch (err) {
+          this.logger.warn(`Hackatime OAuth /me fallback failed for project ${projectId}: ${err}`);
+        }
+      }
+      if (!hackatimeUserId) {
+        return this.emptyHackatimeResult(projectId, user);
+      }
+
+      // 2. Get user info (trust level), projects, and Unified duplicate check in parallel
+      const [infoRes, projectsRes, unifiedResult] = await Promise.all([
+        this.hackatimeGet(`/api/admin/v1/user/info?user_id=${hackatimeUserId}`),
+        this.hackatimeGet(`/api/admin/v1/user/projects?user_id=${hackatimeUserId}`),
+        this.checkUnifiedDuplicate(project.codeUrl ?? ''),
+      ]);
+
+      const debug: { infoStatus: number; projectsStatus: number; totalProjectsReturned: number; linkedNames: string[]; availableNames: string[] } = {
+        infoStatus: infoRes.status,
+        projectsStatus: projectsRes.status,
+        totalProjectsReturned: 0,
+        linkedNames: hackatimeNames,
+        availableNames: [],
+      };
+
+      let trustLevel: string | null = null;
+      let linkedBanned = false;
+      let linkedEmail: string | null = null;
+      let linkedSlackUid: string | null = null;
+      let emailMismatch = false;
+      if (infoRes.ok) {
+        const infoData = await infoRes.json();
+        const u = infoData?.user ?? infoData?.data ?? infoData ?? {};
+        trustLevel = u?.trust_level ?? u?.trust_factor?.trust_level ?? null;
+        linkedBanned = u?.banned === true;
+        linkedSlackUid = typeof u?.slack_uid === 'string' ? u.slack_uid : null;
+        const rawEmails = u?.email_addresses ?? u?.emails ?? [];
+        if (Array.isArray(rawEmails) && rawEmails.length > 0) {
+          const emails = rawEmails.filter(
+            (e): e is string => typeof e === 'string',
+          );
+          linkedEmail = emails[0] ?? null;
+          if (user.email) {
+            const own = user.email.toLowerCase();
+            emailMismatch = !emails.some((e) => e.toLowerCase() === own);
+          }
+        }
+      }
+
+      let matched: { name: string; hours: number; languages: string[]; firstHeartbeat: number | null }[] = [];
+      if (projectsRes.ok) {
+        const projData = await projectsRes.json();
+        const allProjects: {
+          name: string;
+          total_duration: number;
+          languages: string[];
+          first_heartbeat?: number | string | null;
+        }[] = projData?.projects ?? projData?.data ?? [];
+
+        debug.totalProjectsReturned = allProjects.length;
+        debug.availableNames = allProjects.map((p) => p.name);
+
+        if (hackatimeNames.length > 0) {
+          const nameSet = new Set(hackatimeNames);
+          matched = allProjects
+            .filter((p) => nameSet.has(p.name))
+            .map((p) => {
+              const fhRaw = p.first_heartbeat ?? null;
+              let firstHeartbeat: number | null = null;
+              if (fhRaw !== null && fhRaw !== undefined) {
+                const n = typeof fhRaw === 'string' ? Number(fhRaw) : fhRaw;
+                if (Number.isFinite(n) && n > 0) {
+                  firstHeartbeat = n > 1e12 ? Math.floor(n / 1000) : Math.floor(n);
+                }
+              }
+              return {
+                name: p.name,
+                hours: Math.round(((p.total_duration ?? (p as any).total_seconds ?? 0) / 3600) * 10) / 10,
+                languages: p.languages ?? [],
+                firstHeartbeat,
+              };
+            });
+        }
+      }
+
+      const totalHours = Math.round(
+        matched.reduce((sum, p) => sum + p.hours, 0) * 10,
+      ) / 10;
+
+      const heartbeatTimes = matched
+        .map((p) => p.firstHeartbeat)
+        .filter((t): t is number => t !== null);
+      const earliestHeartbeat = heartbeatTimes.length > 0 ? Math.min(...heartbeatTimes) : null;
+
+      // Calculate previous approved hours for delta display on resubmissions
+      const lastApprovedSub = await this.submissionRepo.findOne({
+        where: { projectId, status: 'approved' },
+        order: { createdAt: 'DESC' },
+        select: ['id', 'overrideHours'],
+      });
+      const previousApprovedHours = lastApprovedSub?.overrideHours ?? 0;
+
+      return {
+        projectId,
+        hackatimeProjects: matched,
+        totalHours,
+        earliestHeartbeat,
+        previousApprovedHours,
+        trustLevel,
+        linkedBanned,
+        linkedEmail,
+        linkedSlackUid,
+        beestEmail: user.email ?? null,
+        beestSlackId: user.slackId ?? null,
+        emailMismatch,
+        unifiedDuplicate: unifiedResult.duplicate,
+        unifiedError: unifiedResult.error,
+        debug,
+      };
+    } catch (err) {
+      this.logger.error(`Hackatime admin lookup error for project ${projectId}: ${err}`);
+      return {
+        projectId,
+        hackatimeProjects: [],
+        totalHours: 0,
+        earliestHeartbeat: null,
+        previousApprovedHours: 0,
+        trustLevel: null,
+        linkedBanned: false,
+        linkedEmail: null,
+        linkedSlackUid: null,
+        beestEmail: null,
+        beestSlackId: null,
+        emailMismatch: false,
+        unifiedDuplicate: false,
+        unifiedError: true,
+      };
+    }
+  }
+
+  // ── News CRUD ──
+
+  async listNews(): Promise<NewsItem[]> {
+    return this.newsRepo.find({ order: { displayDate: 'DESC', createdAt: 'DESC' } });
+  }
+
+  async createNews(text: string, displayDate: string): Promise<NewsItem> {
+    const item = this.newsRepo.create({ text, displayDate });
+    return this.newsRepo.save(item);
+  }
+
+  async updateNews(id: string, data: { text?: string; displayDate?: string }): Promise<NewsItem> {
+    const item = await this.newsRepo.findOne({ where: { id } });
+    if (!item) throw new NotFoundException('News item not found');
+    if (data.text !== undefined) item.text = data.text;
+    if (data.displayDate !== undefined) item.displayDate = data.displayDate;
+    return this.newsRepo.save(item);
+  }
+
+  async deleteNews(id: string): Promise<void> {
+    const item = await this.newsRepo.findOne({ where: { id } });
+    if (!item) throw new NotFoundException('News item not found');
+    await this.newsRepo.remove(item);
+  }
+
+  // ── Shop CRUD ──
+
+  async listShopItems(): Promise<ShopItem[]> {
+    return this.shopRepo.find({ order: { sortOrder: 'ASC' } });
+  }
+
+  async createShopItem(data: {
+    name: string;
+    description: string;
+    imageUrl: string;
+    priceHours: number;
+    stock?: number | null;
+    estimatedShip?: string | null;
+    isActive?: boolean;
+  }): Promise<ShopItem> {
+    const maxOrder = await this.shopRepo
+      .createQueryBuilder('s')
+      .select('MAX(s.sortOrder)', 'max')
+      .getRawOne();
+    const sortOrder = (maxOrder?.max ?? -1) + 1;
+
+    const item = this.shopRepo.create({
+      name: data.name,
+      description: data.description,
+      imageUrl: data.imageUrl,
+      priceHours: data.priceHours,
+      stock: data.stock ?? null,
+      estimatedShip: data.estimatedShip ?? null,
+      isActive: data.isActive ?? true,
+      sortOrder,
+    });
+    return this.shopRepo.save(item);
+  }
+
+  async updateShopItem(id: string, data: {
+    name?: string;
+    description?: string;
+    imageUrl?: string;
+    priceHours?: number;
+    stock?: number | null;
+    estimatedShip?: string | null;
+    isActive?: boolean;
+  }): Promise<ShopItem> {
+    const item = await this.shopRepo.findOne({ where: { id } });
+    if (!item) throw new NotFoundException('Shop item not found');
+    if (data.name !== undefined) item.name = data.name;
+    if (data.description !== undefined) item.description = data.description;
+    if (data.imageUrl !== undefined) item.imageUrl = data.imageUrl;
+    if (data.priceHours !== undefined) item.priceHours = data.priceHours;
+    if (data.stock !== undefined) item.stock = data.stock;
+    if (data.estimatedShip !== undefined) item.estimatedShip = data.estimatedShip;
+    if (data.isActive !== undefined) item.isActive = data.isActive;
+    return this.shopRepo.save(item);
+  }
+
+  async deleteShopItem(id: string): Promise<void> {
+    const item = await this.shopRepo.findOne({ where: { id } });
+    if (!item) throw new NotFoundException('Shop item not found');
+    await this.shopRepo.remove(item);
+  }
+
+  async reorderShopItems(items: { id: string; sortOrder: number }[]): Promise<void> {
+    await Promise.all(
+      items.map((i) => this.shopRepo.update(i.id, { sortOrder: i.sortOrder })),
+    );
+  }
+}

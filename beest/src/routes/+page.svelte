@@ -192,14 +192,14 @@
       class:valid={topValid}
       class:sending={topStatus === 'sending'}
       disabled={!topValid || topStatus === 'sending'}
-      onclick={() => submitRsvp(topEmail, (s) => topStatus = s)}
+      on:click={() => submitRsvp(topEmail, (s) => topStatus = s)}
     >
       {#if topStatus === 'sending'}Sending...{:else}RSVP{/if}
     </button>
     {#if topStatus === 'error'}<p class="rsvp-error">Something went wrong, please try again.</p>{/if}
     <label class="updates">
       <input type="checkbox" bind:checked={topUpdates} />
-      <span>recieve email updates</span>
+      <span>receive email updates</span>
     </label>
     <p class="rsvp-note">
       We will ask for an address to send the stickers to, Please use a real address or opt out since we send real stickers! You can always
@@ -390,14 +390,14 @@
         class:valid={bottomValid}
         class:sending={bottomStatus === 'sending'}
         disabled={!bottomValid || bottomStatus === 'sending'}
-        onclick={() => submitRsvp(bottomEmail, (s) => bottomStatus = s)}
+        on:click={() => submitRsvp(bottomEmail, (s) => bottomStatus = s)}
       >
         {#if bottomStatus === 'sending'}Sending...{:else}RSVP{/if}
       </button>
       {#if bottomStatus === 'error'}<p class="rsvp-error">Something went wrong, please try again.</p>{/if}
       <label class="updates">
         <input type="checkbox" bind:checked={bottomUpdates} />
-        <span>recieve email updates</span>
+        <span>receive email updates</span>
       </label>
       <p class="rsvp-note">
         We will ask for an address to send the stickers to, Please use a real address or opt out since we send real stickers! You can always
@@ -446,7 +446,7 @@
 
 </div><!-- saturate-wrap -->
 
-<button class="translate-btn" onclick={() => dutch = !dutch} aria-label="Toggle Dutch translation">
+<button class="translate-btn" on:click={() => dutch = !dutch} aria-label="Toggle Dutch translation">
   {dutch ? '🇬🇧 EN' : '🇳🇱 NL'}
 </button>
 

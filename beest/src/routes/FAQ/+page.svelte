@@ -33,7 +33,7 @@
     },
     {
       q: 'How much does it cost?',
-      a: 'Beest is completely free to participate in! All costs for the event are covered, including food, accomodation, day-off travel and merchandise. Additionally participants can earn stipends for visa application fees and flight costs.'
+      a: 'Beest is completely free to participate in! All costs for the event are covered, including food, accommodation, day-off travel and merchandise. Additionally participants can earn stipends for visa application fees and flight costs.'
     },
     {
       q: 'Where and when does Beest take place?',

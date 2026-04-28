@@ -15,9 +15,11 @@
 	}
 
 	$effect(() => {
-		checkImpersonating();
-		if (localStorage.getItem('customCursor') !== 'off') {
-			document.documentElement.classList.add('custom-cursor');
+		if (typeof document !== 'undefined') {
+			checkImpersonating();
+			if (typeof localStorage !== 'undefined' && localStorage.getItem('customCursor') !== 'off') {
+				document.documentElement.classList.add('custom-cursor');
+			}
 		}
 	});
 </script>
@@ -27,7 +29,7 @@
 </svelte:head>
 
 {#if impersonating}
-	<button class="end-impersonate" onclick={endImpersonation}>
+	<button class="end-impersonate" on:click={endImpersonation}>
 		End Impersonation
 	</button>
 {/if}

@@ -148,7 +148,7 @@
     hasScreenshots &&
     !submitting
   );
-  let projectCols = $derived(Math.min(2, Math.ceil(Math.sqrt(projects.length))));
+  let projectCols = $derived(Math.max(1, Math.min(2, Math.ceil(Math.sqrt(projects.length)))));
 
   // Review checklist
   let reviewProject = $state<any>(null);
@@ -857,6 +857,15 @@
   }
 
   onMount(() => {
+    // Ensure custom cursor class matches saved preference on initial load
+    if (typeof document !== 'undefined') {
+      if (customCursorEnabled) {
+        document.documentElement.classList.add('custom-cursor');
+      } else {
+        document.documentElement.classList.remove('custom-cursor');
+      }
+    }
+
     let loaded = 0;
     for (const src of ['/images/tile.webp', '/images/tile2.webp', '/images/tile3.webp']) {
       const img = new Image();

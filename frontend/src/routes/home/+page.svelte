@@ -15,6 +15,19 @@
   import { onMount } from 'svelte';
   import confetti from 'canvas-confetti';
 
+  // Portal action: moves a node to document.body so its position:fixed
+  // escapes any ancestor containing-block (.main has filter: saturate which
+  // otherwise pins fixed descendants to .main, making modals drift on long pages).
+  function portal(node: HTMLElement) {
+    const target = document.body;
+    target.appendChild(node);
+    return {
+      destroy() {
+        if (node.parentNode) node.parentNode.removeChild(node);
+      },
+    };
+  }
+
   let { data } = $props();
 
   let mobileWarningDismissed = $state(false);
@@ -70,7 +83,7 @@
   let stickerLink = $state<string | null>(null);
 
   // Shop state
-  type ShopItemType = { id: string; name: string; description: string; imageUrl: string; priceHours: number; stock: number | null; sortOrder: number; estimatedShip: string | null };
+  type ShopItemType = { id: string; name: string; description: string; detailedDescription: string | null; imageUrl: string; priceHours: number; stock: number | null; sortOrder: number; estimatedShip: string | null };
   let shopItems = $state<ShopItemType[]>([]);
   let shopLoading = $state(false);
   let shopLoaded = $state(false);
@@ -88,6 +101,14 @@
   let unreadCount = $state(0);
   let nicknameInput = $state(data.user.nickname ?? '');
   let nicknameSaving = $state(false);
+  let genderSaving = $state(false);
+  const GENDER_OPTIONS: { value: string; label: string }[] = [
+    { value: 'male', label: 'Male' },
+    { value: 'female', label: 'Female' },
+    { value: 'non_binary_other', label: 'Non Binary / Other' },
+    { value: 'not_sure', label: "I'm Not Sure" },
+    { value: 'prefer_not_to_say', label: 'Prefer not to say' },
+  ];
   let totalBuilders = $state(0);
   let totalHours = $state(0);
   let hoursByStatus = $state<Record<string, number>>({});
@@ -809,6 +830,22 @@
     nicknameSaving = false;
   }
 
+  async function saveGender(value: string) {
+    if (!value || value === data.user.gender) return;
+    genderSaving = true;
+    try {
+      const res = await fetch('/api/auth/gender', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ gender: value })
+      });
+      if (res.ok) {
+        data.user.gender = value;
+      }
+    } catch { /* ignore */ }
+    genderSaving = false;
+  }
+
   async function fetchStickerLink() {
     try {
       const res = await fetch('/api/onboarding/sticker-link');
@@ -1119,6 +1156,7 @@
               <option value="python">Python</option>
               <option value="android">Android Playable</option>
               <option value="ios">iOS Playable</option>
+              <option value="other">Other / Not Sure</option>
             </select>
           </div>
           <div class="form-group hackatime-group">
@@ -1139,7 +1177,7 @@
                     {#if hackatimeLoading}
                       <span class="hackatime-empty">Loading...</span>
                     {:else if hackatimeProjects.length === 0}
-                      <span class="hackatime-empty">No projects found</span>
+                      <span class="hackatime-empty">No projects found, redo tutorial?</span>
                     {:else}
                       {#each hackatimeProjects as proj}
                         <label class="hackatime-option">
@@ -1158,11 +1196,13 @@
                   </div>
                 {/if}
               </div>
-              <button type="button" class="refresh-btn" onclick={fetchHackatimeProjects} disabled={hackatimeLoading} title="Refresh Hackatime projects">
-                <svg class="refresh-icon" class:spinning={hackatimeLoading} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M21.5 2v6h-6M2.5 22v-6h6M2 11.5a10 10 0 0 1 18.8-4.3M22 12.5a10 10 0 0 1-18.8 4.3" />
-                </svg>
-              </button>
+              <form method="POST" action="/api/auth/hackatime/start" target="_blank" rel="noopener" class="refresh-form" onsubmit={() => { fetchHackatimeProjects(); setTimeout(fetchHackatimeProjects, 30000); }}>
+                <button type="submit" class="refresh-btn" disabled={hackatimeLoading} title="Refresh & re-link Hackatime">
+                  <svg class="refresh-icon" class:spinning={hackatimeLoading} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M21.5 2v6h-6M2.5 22v-6h6M2 11.5a10 10 0 0 1 18.8-4.3M22 12.5a10 10 0 0 1-18.8 4.3" />
+                  </svg>
+                </button>
+              </form>
             </div>
           </div>
         </div>
@@ -1456,7 +1496,7 @@
             <div class="shop-header">
               <div>
                 <h2 class="section-title">Earn Prizes</h2>
-                <p class="section-subtitle">Build projects, earn hours, unlock rewards.</p>
+                <p class="section-subtitle">Build projects, earn hours, unlock rewards.<br><b>Hours spent in the shop detract from qualifying hours!</b></p>
               </div>
               <div class="pipes-box">
                 <img src="/images/pipes.png" alt="Pipes" class="pipe-img" />
@@ -1514,7 +1554,7 @@
     <!-- Fullscreen shop item modal -->
     {#if selectedShopItem}
     <!-- svelte-ignore a11y_no_static_element_interactions -->
-    <div class="shop-modal-overlay" onclick={closeShopItem} onkeydown={(e) => { if (e.key === 'Escape') closeShopItem(); }}>
+    <div use:portal class="shop-modal-overlay" onclick={closeShopItem} onkeydown={(e) => { if (e.key === 'Escape') closeShopItem(); }}>
       <!-- svelte-ignore a11y_no_static_element_interactions -->
       <div class="shop-modal" onclick={(e) => e.stopPropagation()}>
         <button class="shop-modal-close" onclick={closeShopItem} type="button" aria-label="Close">&times;</button>
@@ -1525,6 +1565,9 @@
           <div class="shop-modal-details">
             <h2 class="shop-modal-name">{selectedShopItem.name}</h2>
             <p class="shop-modal-desc">{selectedShopItem.description}</p>
+            {#if selectedShopItem.detailedDescription}
+              <p class="shop-modal-detailed-desc">{selectedShopItem.detailedDescription}</p>
+            {/if}
 
             <div class="shop-modal-price-row">
               <span class="shop-modal-price">{selectedShopItem.priceHours} Pipes</span>
@@ -1883,7 +1926,7 @@
                 <p class="settings-link-desc">Ask questions in #beest-help on Slack.</p>
               </a>
               <div class="settings-link">
-                <h3 class="settings-link-title">Bug Bounty</h3>
+                <h3 class="settings-link-title">Security Bounty</h3>
                 <p class="settings-link-desc">Beest is participating in a security bounty. You can submit proven vulnerabilities for reward <a href="https://security.hackclub.com/" target="_blank" rel="noopener">here</a>.</p>
               </div>
               <a href="/api/auth/logout" class="settings-link settings-link-logout">
@@ -1947,6 +1990,20 @@
                   <span class="account-label">Slack ID</span>
                   <span class="account-value">{data.user.slack_id ?? '—'}</span>
                 </div>
+                <div class="account-field">
+                  <span class="account-label">Gender</span>
+                  <select
+                    class="gender-select"
+                    value={data.user.gender ?? ''}
+                    disabled={genderSaving}
+                    onchange={(e) => saveGender(e.currentTarget.value)}
+                  >
+                    <option value="" disabled>Select…</option>
+                    {#each GENDER_OPTIONS as opt}
+                      <option value={opt.value}>{opt.label}</option>
+                    {/each}
+                  </select>
+                </div>
               </div>
             </div>
             <div class="account-card fulfillment-card">
@@ -2004,7 +2061,6 @@
     margin: 0;
     padding: 0;
     background: #4b4840;
-    filter: saturate(1.5);
   }
 
   /* ── layout ──────────────────────────────────────── */
@@ -2252,6 +2308,7 @@
     max-width: calc(100vw - 170px);
     display: flex;
     flex-direction: column;
+    filter: saturate(1.5);
   }
 
   /* ── sections ────────────────────────────────────── */
@@ -3328,6 +3385,10 @@
     padding: 4px;
   }
 
+  .refresh-form {
+    display: contents;
+  }
+
   .refresh-btn {
     background: #4b4840;
     border: 2px solid #6c6659;
@@ -3481,13 +3542,15 @@
   .shop-container {
     background: #8a7f6f;
     padding: 32px;
+    overflow: hidden;
     clip-path: polygon(0% 0.5%, 2% 0%, 6% 0.5%, 10% 0%, 16% 0.4%, 22% 0%, 28% 0.5%, 34% 0%, 40% 0.4%, 46% 0%, 52% 0.5%, 58% 0%, 64% 0.4%, 70% 0%, 76% 0.5%, 82% 0%, 88% 0.4%, 94% 0%, 98% 0.5%, 100% 0%, 100% 5%, 99.4% 10%, 100% 16%, 99.5% 22%, 100% 28%, 99.4% 34%, 100% 40%, 99.5% 46%, 100% 52%, 99.4% 58%, 100% 64%, 99.5% 70%, 100% 76%, 99.4% 82%, 100% 88%, 99.5% 94%, 100% 99.5%, 98% 100%, 94% 99.5%, 88% 100%, 82% 99.6%, 76% 100%, 70% 99.5%, 64% 100%, 58% 99.6%, 52% 100%, 46% 99.5%, 40% 100%, 34% 99.6%, 28% 100%, 22% 99.5%, 16% 100%, 10% 99.6%, 6% 100%, 2% 99.5%, 0% 100%, 0% 94%, 0.5% 88%, 0% 82%, 0.6% 76%, 0% 70%, 0.5% 64%, 0% 58%, 0.6% 52%, 0% 46%, 0.5% 40%, 0% 34%, 0.6% 28%, 0% 22%, 0.5% 16%, 0% 10%, 0.6% 5%);
   }
 
   .shop-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(160px, 200px));
+    grid-template-columns: repeat(3, 1fr);
     gap: 20px;
+    justify-content: center;
   }
 
   .shop-card {
@@ -3693,6 +3756,15 @@
     font-size: 16px;
     color: #1a1a1a;
     line-height: 1.5;
+  }
+
+  .shop-modal-detailed-desc {
+    margin: 8px 0 0;
+    font-family: "Sunny Mood", "Courier New", monospace;
+    font-size: 14px;
+    color: #4b4840;
+    line-height: 1.5;
+    white-space: pre-line;
   }
 
   .shop-modal-price-row {
@@ -4474,9 +4546,15 @@
 
   .explore-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
-    gap: 28px;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 20px;
     opacity: 0.35;
+  }
+
+  @media (max-width: 1100px) {
+    .explore-grid {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
   }
 
   .explore-card-skeleton {
@@ -4606,21 +4684,21 @@
   }
 
   .explore-card-body {
-    padding: 14px 16px 16px;
+    padding: 10px 12px 12px;
     display: flex;
     flex-direction: column;
-    gap: 8px;
+    gap: 6px;
   }
 
   .explore-card-header {
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: 8px;
   }
 
   .explore-card-name {
     font-family: "Sunny Mood", "Courier New", monospace;
-    font-size: 22px;
+    font-size: 17px;
     color: #e6f4fe;
     text-shadow: 2px 2px 0 rgba(0, 0, 0, 0.3);
     margin: 0;
@@ -4628,30 +4706,30 @@
 
   .explore-card-type {
     font-family: "Courier New", monospace;
-    font-size: 11px;
+    font-size: 9px;
     font-weight: 700;
     text-transform: uppercase;
     letter-spacing: 0.06em;
     color: #3a3832;
     background: #cbc1ae;
-    padding: 3px 8px;
+    padding: 2px 6px;
     clip-path: polygon(4% 0%, 96% 4%, 100% 96%, 0% 100%);
   }
 
   .explore-card-desc {
     font-family: "Courier New", monospace;
-    font-size: 13px;
+    font-size: 11px;
     color: rgba(230, 244, 254, 0.7);
-    line-height: 1.4;
+    line-height: 1.35;
     margin: 0;
   }
 
   .explore-card-meta {
     display: flex;
     align-items: center;
-    gap: 12px;
+    gap: 10px;
     font-family: "Courier New", monospace;
-    font-size: 12px;
+    font-size: 10px;
     color: rgba(230, 244, 254, 0.45);
   }
 
@@ -4662,13 +4740,13 @@
 
   .explore-card-links {
     display: flex;
-    gap: 10px;
-    margin-top: 4px;
+    gap: 8px;
+    margin-top: 2px;
   }
 
   .explore-link {
     font-family: "Courier New", monospace;
-    font-size: 13px;
+    font-size: 11px;
     font-weight: 700;
     color: #93b4cd;
     text-decoration: none;
@@ -5408,6 +5486,32 @@
     cursor: default;
   }
 
+  .gender-select {
+    font-family: "Courier New", monospace;
+    font-size: 15px;
+    color: #000;
+    background: rgba(0, 0, 0, 0.25);
+    border: 1px solid rgba(203, 193, 174, 0.3);
+    padding: 4px 8px;
+    text-align: right;
+    cursor: pointer;
+  }
+
+  .gender-select option {
+    color: #000;
+    background: #cbc1ae;
+  }
+
+  .gender-select:focus {
+    outline: none;
+    border-color: #93b4cd;
+  }
+
+  .gender-select:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+
   .pref-toggle {
     display: flex;
     align-items: center;
@@ -5773,7 +5877,7 @@
     }
 
     .shop-grid {
-      grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+      grid-template-columns: repeat(3, 1fr);
       gap: 14px;
     }
 

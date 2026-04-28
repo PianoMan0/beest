@@ -1,4 +1,7 @@
 <script lang="ts">
+	import DauChart from './DauChart.svelte';
+	import SignupsChart from './SignupsChart.svelte';
+	import UserFunnel from './UserFunnel.svelte';
 	let { data } = $props();
 
 	interface UserSummary {
@@ -31,6 +34,7 @@
 	}
 
 	const isReviewer = $derived(data.role === 'Reviewer' || data.role === 'Fraud Reviewer');
+	const isSuperAdmin = $derived(data.role === 'Super Admin');
 	let activeTab = $state('users');
 	let users: UserSummary[] = $state([]);
 	let loading = $state(true);
@@ -83,7 +87,7 @@
 	let allProjects: ProjectSummary[] = $state([]);
 	let statusCounts: StatusCounts = $state({ unshipped: 0, unreviewed: 0, changes_needed: 0, approved: 0 });
 	let projectsLoading = $state(false);
-	let projectStatusFilter = $state('');
+	let projectStatusFilter = $state(data.role === 'Super Admin' ? '' : 'unreviewed');
 	let projectTypeFilter = $state('');
 	let projectSearch = $state('');
 
@@ -152,6 +156,25 @@
 			}
 		} finally {
 			reviewSubmitting = false;
+		}
+	}
+
+	let resyncLoading = $state(false);
+	async function resyncAirtable() {
+		if (!expandedProjectId || resyncLoading) return;
+		resyncLoading = true;
+		try {
+			const res = await fetch(`/api/admin/projects/${expandedProjectId}/resync-airtable`, { method: 'POST' });
+			if (res.ok) {
+				alert('Project re-pushed to Airtable.');
+			} else {
+				const data = await res.json().catch(() => null);
+				alert(data?.message ?? 'Failed to re-push to Airtable.');
+			}
+		} catch {
+			alert('Failed to re-push to Airtable.');
+		} finally {
+			resyncLoading = false;
 		}
 	}
 
@@ -230,7 +253,7 @@
 
 		const proj = allProjects.find(p => p.id === projectId);
 		loadReviews(projectId);
-		if (proj?.status === 'unreviewed') {
+		if (proj?.status === 'unreviewed' || proj?.status === 'approved') {
 			hackatimeLoading = true;
 			try {
 				const res = await fetch(`/api/admin/projects/${projectId}/hackatime`);
@@ -257,7 +280,7 @@
 
 	const PERMS_OPTIONS = ['User', 'Helper', 'Reviewer', 'Fraud Reviewer', 'Super Admin', 'Banned'];
 
-	const PROJECT_TYPES = ['web', 'windows', 'mac', 'linux', 'cross-platform', 'python', 'android', 'ios'];
+	const PROJECT_TYPES = ['web', 'windows', 'mac', 'linux', 'cross-platform', 'python', 'android', 'ios', 'other'];
 
 	let filteredProjects = $derived.by(() => {
 		let result = allProjects;
@@ -344,6 +367,39 @@
 			const res = await fetch(`/api/admin/users/${selectedUser.id}/ban`, { method: 'POST' });
 			if (res.ok) {
 				await selectUser(selectedUser);
+			}
+		} finally {
+			actionLoading = '';
+		}
+	}
+
+	let pipesAdjustAmount = $state(0);
+	let pipesAdjustReason = $state('');
+
+	async function adjustPipes(sign: 1 | -1) {
+		if (!selectedUser) return;
+		const amount = Math.floor(Math.abs(pipesAdjustAmount));
+		if (!Number.isFinite(amount) || amount <= 0) {
+			alert('Enter a positive whole number of pipes.');
+			return;
+		}
+		const delta = sign * amount;
+		const verb = sign > 0 ? 'GRANT' : 'REVOKE';
+		if (!confirm(`${verb} ${amount} pipes ${sign > 0 ? 'to' : 'from'} ${selectedUser.name ?? selectedUser.hcaSub}?`)) return;
+		actionLoading = 'pipes';
+		try {
+			const res = await fetch(`/api/admin/users/${selectedUser.id}/pipes`, {
+				method: 'PATCH',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ delta, reason: pipesAdjustReason.trim() || null })
+			});
+			if (res.ok) {
+				pipesAdjustAmount = 0;
+				pipesAdjustReason = '';
+				await selectUser(selectedUser);
+			} else {
+				const err = await res.json().catch(() => ({}));
+				alert(`Pipes adjustment failed: ${err.message ?? res.statusText}`);
 			}
 		} finally {
 			actionLoading = '';
@@ -453,11 +509,44 @@
 		}
 	}
 
+	// Review leaderboard state
+	interface LeaderboardRow {
+		reviewerId: string;
+		reviewerName: string | null;
+		reviewerSlackId: string | null;
+		total: number;
+		approved: number;
+		changesNeeded: number;
+		banned: number;
+		approvalPercent: number;
+	}
+	let leaderboardRows: LeaderboardRow[] = $state([]);
+	let leaderboardLoading = $state(false);
+	let leaderboardWindow = $state<'24h' | '7d' | '30d' | 'all'>('7d');
+
+	$effect(() => {
+		void leaderboardWindow;
+		if (activeTab === 'leaderboard') loadLeaderboard();
+	});
+
+	async function loadLeaderboard() {
+		leaderboardLoading = true;
+		try {
+			const res = await fetch(`/api/admin/review-leaderboard?window=${leaderboardWindow}`);
+			if (res.ok) {
+				leaderboardRows = await res.json();
+			}
+		} finally {
+			leaderboardLoading = false;
+		}
+	}
+
 	// Shop state
 	interface ShopItemAdmin {
 		id: string;
 		name: string;
 		description: string;
+		detailedDescription: string | null;
 		imageUrl: string;
 		priceHours: number;
 		stock: number | null;
@@ -471,6 +560,7 @@
 	let editingShop: ShopItemAdmin | null = $state(null);
 	let newShopName = $state('');
 	let newShopDesc = $state('');
+	let newShopDetailedDesc = $state('');
 	let newShopImage = $state('');
 	let newShopPrice = $state(0);
 	let newShopStock = $state('');
@@ -499,6 +589,7 @@
 				body: JSON.stringify({
 					name: newShopName,
 					description: newShopDesc,
+					detailedDescription: newShopDetailedDesc.trim() || null,
 					imageUrl: newShopImage,
 					priceHours: newShopPrice,
 					stock: newShopStock.trim() === '' ? null : parseInt(newShopStock),
@@ -509,6 +600,7 @@
 			if (res.ok) {
 				newShopName = '';
 				newShopDesc = '';
+				newShopDetailedDesc = '';
 				newShopImage = '';
 				newShopPrice = 0;
 				newShopStock = '';
@@ -531,6 +623,7 @@
 				body: JSON.stringify({
 					name: editingShop.name,
 					description: editingShop.description,
+					detailedDescription: editingShop.detailedDescription,
 					imageUrl: editingShop.imageUrl,
 					priceHours: editingShop.priceHours,
 					stock: editingShop.stock,
@@ -687,11 +780,13 @@
 			activeTab = 'projects';
 			return;
 		}
-		if (activeTab === 'users') loadUsers();
+		if (activeTab === 'users') { loadUsers(); }
+		if (activeTab === 'stats') { loadUsers(); }
 		if (activeTab === 'news') loadNews();
 		if (activeTab === 'projects') loadProjects();
 		if (activeTab === 'shop') loadShop();
 		if (activeTab === 'fulfillment') loadFulfillment();
+		if (activeTab === 'leaderboard') loadLeaderboard();
 	});
 </script>
 
@@ -707,11 +802,13 @@
 	<nav class="admin-tabs">
 		{#if !isReviewer}
 			<button class="tab" class:active={activeTab === 'users'} onclick={() => { activeTab = 'users'; closeDetail(); }}>Users</button>
+			<button class="tab" class:active={activeTab === 'stats'} onclick={() => activeTab = 'stats'}>Stats</button>
 			<button class="tab" class:active={activeTab === 'news'} onclick={() => activeTab = 'news'}>News</button>
 			<button class="tab" class:active={activeTab === 'shop'} onclick={() => activeTab = 'shop'}>Shop</button>
 			<button class="tab" class:active={activeTab === 'fulfillment'} onclick={() => activeTab = 'fulfillment'}>Fulfillment</button>
 		{/if}
 		<button class="tab" class:active={activeTab === 'projects'} onclick={() => activeTab = 'projects'}>Projects</button>
+		<button class="tab" class:active={activeTab === 'leaderboard'} onclick={() => activeTab = 'leaderboard'}>Leaderboard</button>
 		<a href="/home" class="tab tab-home">Home</a>
 	</nav>
 
@@ -719,16 +816,6 @@
 		{#if activeTab === 'users'}
 			<div class="users-layout" class:has-detail={selectedUser}>
 				<div class="users-table-wrap">
-					<div class="stat-cards">
-						<div class="stat-card">
-							<span class="stat-value">{totalUsers}</span>
-							<span class="stat-label">Total Users</span>
-						</div>
-						<div class="stat-card">
-							<span class="stat-value">{totalHackatime}</span>
-							<span class="stat-label">Hackatime Linked</span>
-						</div>
-					</div>
 					<div class="users-toolbar">
 						<input type="text" placeholder="Search by name, email or Slack ID..." bind:value={userSearch} class="users-search" />
 						<select bind:value={permsFilter} class="users-perms-filter">
@@ -857,6 +944,45 @@
 
 								<section class="detail-section">
 									<h3>Pipes Balance: {userDetail.pipes ?? 0}</h3>
+									{#if isSuperAdmin}
+										<div class="pipes-adjust">
+											<div class="pipes-adjust-row">
+												<input
+													type="number"
+													min="1"
+													step="1"
+													placeholder="Amount"
+													class="pipes-input"
+													bind:value={pipesAdjustAmount}
+													disabled={actionLoading !== ''}
+												/>
+												<input
+													type="text"
+													placeholder="Reason (optional)"
+													class="pipes-input pipes-input-reason"
+													bind:value={pipesAdjustReason}
+													maxlength="200"
+													disabled={actionLoading !== ''}
+												/>
+											</div>
+											<div class="pipes-adjust-row">
+												<button
+													class="btn btn-pipes-grant"
+													onclick={() => adjustPipes(1)}
+													disabled={actionLoading !== '' || !pipesAdjustAmount || pipesAdjustAmount <= 0}
+												>
+													{actionLoading === 'pipes' ? 'Working…' : `Grant ${Math.max(0, Math.floor(Math.abs(pipesAdjustAmount || 0)))}`}
+												</button>
+												<button
+													class="btn btn-pipes-revoke"
+													onclick={() => adjustPipes(-1)}
+													disabled={actionLoading !== '' || !pipesAdjustAmount || pipesAdjustAmount <= 0}
+												>
+													{actionLoading === 'pipes' ? 'Working…' : `Revoke ${Math.max(0, Math.floor(Math.abs(pipesAdjustAmount || 0)))}`}
+												</button>
+											</div>
+										</div>
+									{/if}
 								</section>
 
 								{#if userDetail.orders?.length > 0}
@@ -900,6 +1026,24 @@
 						{/if}
 					</div>
 				{/if}
+			</div>
+		{:else if activeTab === 'stats'}
+			<div class="stats-section">
+				<div class="stat-cards">
+					<div class="stat-card">
+						<span class="stat-value">{totalUsers}</span>
+						<span class="stat-label">Logged-in Users</span>
+					</div>
+					<div class="stat-card">
+						<span class="stat-value">{totalHackatime}</span>
+						<span class="stat-label">Hackatime Linked</span>
+					</div>
+				</div>
+				<div class="stats-grid">
+					<DauChart />
+					<SignupsChart />
+				</div>
+				<UserFunnel />
 			</div>
 		{:else if activeTab === 'news'}
 			<div class="news-admin">
@@ -1034,7 +1178,8 @@
 					<div class="shop-form-grid">
 						<input type="text" placeholder="Name" bind:value={newShopName} class="shop-input" />
 						<input type="text" placeholder="Image URL (e.g. /images/shop/item.webp)" bind:value={newShopImage} class="shop-input" />
-						<textarea placeholder="Description" bind:value={newShopDesc} class="shop-input shop-textarea" rows="2"></textarea>
+						<textarea placeholder="Description (shown on card)" bind:value={newShopDesc} class="shop-input shop-textarea" rows="2"></textarea>
+						<textarea placeholder="Detailed description (shown in popup only)" bind:value={newShopDetailedDesc} class="shop-input shop-textarea" rows="3"></textarea>
 						<div class="shop-form-row">
 							<label class="shop-field">
 								<span>Price (hours)</span>
@@ -1085,7 +1230,8 @@
 									<div class="shop-item-edit">
 										<input type="text" bind:value={editingShop.name} class="shop-input" />
 										<input type="text" bind:value={editingShop.imageUrl} class="shop-input" placeholder="Image URL" />
-										<textarea bind:value={editingShop.description} class="shop-input shop-textarea" rows="2"></textarea>
+										<textarea bind:value={editingShop.description} class="shop-input shop-textarea" rows="2" placeholder="Description (shown on card)"></textarea>
+									<textarea bind:value={editingShop.detailedDescription} class="shop-input shop-textarea" rows="3" placeholder="Detailed description (shown in popup only)"></textarea>
 										<div class="shop-form-row">
 											<label class="shop-field">
 												<span>Price (h)</span>
@@ -1132,13 +1278,15 @@
 		{:else if activeTab === 'projects'}
 			<div class="projects-admin">
 				<div class="status-pills">
-					<button class="pill" class:active={projectStatusFilter === ''} onclick={() => projectStatusFilter = ''}>
-						All <span class="pill-count">{statusCounts.unshipped + statusCounts.unreviewed + statusCounts.changes_needed + statusCounts.approved}</span>
-					</button>
-					<button class="pill pill-unshipped" class:active={projectStatusFilter === 'unshipped'} onclick={() => projectStatusFilter = projectStatusFilter === 'unshipped' ? '' : 'unshipped'}>
-						Unshipped <span class="pill-count">{statusCounts.unshipped}</span>
-					</button>
-					<button class="pill pill-unreviewed" class:active={projectStatusFilter === 'unreviewed'} onclick={() => projectStatusFilter = projectStatusFilter === 'unreviewed' ? '' : 'unreviewed'}>
+					{#if isSuperAdmin}
+						<button class="pill" class:active={projectStatusFilter === ''} onclick={() => projectStatusFilter = ''}>
+							All <span class="pill-count">{statusCounts.unshipped + statusCounts.unreviewed + statusCounts.changes_needed + statusCounts.approved}</span>
+						</button>
+						<button class="pill pill-unshipped" class:active={projectStatusFilter === 'unshipped'} onclick={() => projectStatusFilter = projectStatusFilter === 'unshipped' ? '' : 'unshipped'}>
+							Unshipped <span class="pill-count">{statusCounts.unshipped}</span>
+						</button>
+					{/if}
+					<button class="pill pill-unreviewed" class:active={projectStatusFilter === 'unreviewed'} onclick={() => projectStatusFilter = projectStatusFilter === 'unreviewed' && isSuperAdmin ? '' : 'unreviewed'}>
 						Unreviewed <span class="pill-count">{statusCounts.unreviewed}</span>
 					</button>
 					<button class="pill pill-changes_needed" class:active={projectStatusFilter === 'changes_needed'} onclick={() => projectStatusFilter = projectStatusFilter === 'changes_needed' ? '' : 'changes_needed'}>
@@ -1180,7 +1328,7 @@
 											{/if}
 										</span>
 										<span class="proj-sidebar-meta">
-											{project.user.name ?? '—'}
+											{isSuperAdmin ? (project.user.name ?? '—') : (project.user.slackId ?? '—')}
 											<span class="badge badge-{project.status} badge-sm">{project.status}</span>
 										</span>
 									</button>
@@ -1201,7 +1349,7 @@
 
 										<div class="proj-main-meta">
 											<span>Type: <strong>{selectedProject.projectType}</strong></span>
-											<span>User: <strong>{selectedProject.user.name ?? '—'}</strong>{selectedProject.user.slackId ? ` (${selectedProject.user.slackId})` : ''}</span>
+											<span>User: <strong>{isSuperAdmin ? (selectedProject.user.name ?? '—') : (selectedProject.user.slackId ?? '—')}</strong>{isSuperAdmin && selectedProject.user.slackId ? ` (${selectedProject.user.slackId})` : ''}</span>
 											<span>Update: <strong>{selectedProject.isUpdate ? 'Yes' : 'No'}</strong></span>
 											<span>Created: <strong>{formatDate(selectedProject.createdAt)}</strong></span>
 										</div>
@@ -1278,7 +1426,7 @@
 									{/if}
 								{/if}
 
-								{#if selectedProject.status === 'unreviewed'}
+								{#if selectedProject.status === 'unreviewed' || selectedProject.status === 'approved'}
 									<hr class="proj-divider" />
 
 									{#if hackatimeLoading}
@@ -1298,15 +1446,19 @@
 											{#if hackatimeData.linkedBanned || hackatimeData.emailMismatch || hackatimeData.trustLevel === 'red'}
 												<div class="ht-ownership-alert">
 													{#if hackatimeData.emailMismatch}
-														<div><strong>⚠ Hackatime account mismatch.</strong> The linked Hackatime user does not contain this builder's email — strongly suggests a shared/alt account.</div>
+														<div><strong>⚠ Hackatime account mismatch.</strong> {isSuperAdmin ? "The linked Hackatime user does not contain this builder's email — strongly suggests a shared/alt account." : 'The linked Hackatime account does not match this builder — strongly suggests a shared/alt account.'}</div>
 													{/if}
 													{#if hackatimeData.linkedBanned || hackatimeData.trustLevel === 'red'}
 														<div><strong>⚠ Linked Hackatime account is banned</strong> (trust: {hackatimeData.trustLevel ?? 'unknown'}{hackatimeData.linkedBanned ? ', banned=true' : ''}).</div>
 													{/if}
 													<div class="ht-ownership-meta">
-														<div>Beest email: <code>{hackatimeData.beestEmail ?? '—'}</code></div>
+														{#if isSuperAdmin}
+															<div>Beest email: <code>{hackatimeData.beestEmail ?? '—'}</code></div>
+														{/if}
 														<div>Beest Slack: <code>{hackatimeData.beestSlackId ?? '—'}</code></div>
-														<div>Linked Hackatime email: <code>{hackatimeData.linkedEmail ?? '—'}</code></div>
+														{#if isSuperAdmin}
+															<div>Linked Hackatime email: <code>{hackatimeData.linkedEmail ?? '—'}</code></div>
+														{/if}
 														<div>Linked Hackatime Slack: <code>{hackatimeData.linkedSlackUid ?? '—'}</code></div>
 													</div>
 												</div>
@@ -1379,7 +1531,7 @@
 									<div class="review-actions">
 										<button class="review-btn review-btn-approve" onclick={() => reviewProject('approved')} disabled={reviewSubmitting}>Approve</button>
 										<button class="review-btn review-btn-reject" onclick={() => reviewProject('changes_needed')} disabled={reviewSubmitting || !userFeedback.trim()}>Reject</button>
-										<button class="review-btn review-btn-ban" onclick={() => { if (confirm('Ban this user and reject their project?')) reviewProject('ban'); }} disabled={reviewSubmitting}>Fail &amp; Ban</button>
+										<button class="review-btn review-btn-ban" onclick={() => { if (confirm('Ban this user and reject their project?')) reviewProject('ban'); }} disabled={reviewSubmitting || !isSuperAdmin} title={!isSuperAdmin ? 'Ban is Super Admin only — flag in internal note and ping Euan' : ''}>Fail &amp; Ban</button>
 									</div>
 								{/if}
 
@@ -1414,6 +1566,15 @@
 										</div>
 									{/each}
 								{/if}
+
+								{#if selectedProject.status === 'approved'}
+									<hr class="proj-divider" />
+									<div class="review-actions">
+										<button class="review-btn review-btn-resync" onclick={resyncAirtable} disabled={resyncLoading || !isSuperAdmin} title={!isSuperAdmin ? 'Re-push is Super Admin only' : ''}>
+											{resyncLoading ? 'Pushing...' : 'Re-push to Airtable'}
+										</button>
+									</div>
+								{/if}
 							{:else}
 								<div class="proj-main-empty">
 									<p>Select a project to review</p>
@@ -1421,6 +1582,48 @@
 							{/if}
 						</div>
 					</div>
+				{/if}
+			</div>
+		{:else if activeTab === 'leaderboard'}
+			<div class="leaderboard">
+				<div class="leaderboard-header">
+					<h2>Review Leaderboard</h2>
+					<div class="leaderboard-windows">
+						<button class="pill" class:active={leaderboardWindow === '24h'} onclick={() => leaderboardWindow = '24h'}>24h</button>
+						<button class="pill" class:active={leaderboardWindow === '7d'} onclick={() => leaderboardWindow = '7d'}>7 days</button>
+						<button class="pill" class:active={leaderboardWindow === '30d'} onclick={() => leaderboardWindow = '30d'}>30 days</button>
+						<button class="pill" class:active={leaderboardWindow === 'all'} onclick={() => leaderboardWindow = 'all'}>All time</button>
+					</div>
+				</div>
+				{#if leaderboardLoading}
+					<p class="loading">Loading leaderboard...</p>
+				{:else if leaderboardRows.length === 0}
+					<p class="empty">No reviews in this window.</p>
+				{:else}
+					<table class="leaderboard-table">
+						<thead>
+							<tr>
+								<th>Reviewer</th>
+								<th>Total</th>
+								<th>Approved</th>
+								<th>Changes Needed</th>
+								<th>Banned</th>
+								<th>Approval %</th>
+							</tr>
+						</thead>
+						<tbody>
+							{#each leaderboardRows as row}
+								<tr>
+									<td>{row.reviewerName ?? row.reviewerSlackId ?? row.reviewerId}</td>
+									<td>{row.total}</td>
+									<td>{row.approved}</td>
+									<td>{row.changesNeeded}</td>
+									<td>{row.banned}</td>
+									<td>{row.approvalPercent}%</td>
+								</tr>
+							{/each}
+						</tbody>
+					</table>
 				{/if}
 			</div>
 		{/if}
@@ -1502,6 +1705,23 @@
 		display: flex;
 		gap: 0.75rem;
 		margin-bottom: 1rem;
+	}
+
+	.stats-section {
+		display: flex;
+		flex-direction: column;
+	}
+
+	.stats-grid {
+		display: grid;
+		grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+		gap: 1rem;
+		margin-bottom: 1rem;
+	}
+
+	.stats-grid :global(.dau-card),
+	.stats-grid :global(.signups-card) {
+		margin-bottom: 0;
 	}
 
 	.stat-card {
@@ -1752,6 +1972,47 @@
 		border-color: #20204a;
 	}
 	.btn-impersonate:hover:not(:disabled) { background: #1a1a3a; }
+
+	.pipes-adjust {
+		display: flex;
+		flex-direction: column;
+		gap: 0.5rem;
+		margin-top: 0.5rem;
+	}
+
+	.pipes-adjust-row {
+		display: flex;
+		gap: 0.5rem;
+		flex-wrap: wrap;
+	}
+
+	.pipes-input {
+		padding: 0.5rem 0.75rem;
+		background: #1a1a1a;
+		border: 1px solid #444;
+		border-radius: 6px;
+		color: #e0e0e0;
+		font-size: 0.85rem;
+		width: 120px;
+	}
+
+	.pipes-input-reason { flex: 1; min-width: 200px; width: auto; }
+
+	.pipes-input:focus { outline: none; border-color: #5b9bd5; }
+
+	.btn-pipes-grant {
+		background: #1e2a1e;
+		color: #7ac47a;
+		border-color: #2a4a2a;
+	}
+	.btn-pipes-grant:hover:not(:disabled) { background: #253525; }
+
+	.btn-pipes-revoke {
+		background: #2a1e1e;
+		color: #d58b5b;
+		border-color: #4a2a20;
+	}
+	.btn-pipes-revoke:hover:not(:disabled) { background: #352525; }
 
 	.perms-action { position: relative; }
 
@@ -2424,6 +2685,69 @@
 		color: #c44040;
 	}
 
+	.review-btn-resync {
+		background: #3a6a9a;
+	}
+
+	.leaderboard {
+		padding: 0.5rem 0;
+	}
+
+	.leaderboard-header {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		margin-bottom: 1rem;
+		flex-wrap: wrap;
+		gap: 1rem;
+	}
+
+	.leaderboard-header h2 {
+		margin: 0;
+		font-size: 1.2rem;
+		color: #eee;
+	}
+
+	.leaderboard-windows {
+		display: flex;
+		gap: 0.5rem;
+	}
+
+	.leaderboard-table {
+		width: 100%;
+		border-collapse: collapse;
+		background: #1e1e1e;
+		border: 1px solid #444;
+		border-radius: 6px;
+		overflow: hidden;
+	}
+
+	.leaderboard-table th,
+	.leaderboard-table td {
+		padding: 0.6rem 0.9rem;
+		text-align: left;
+		border-bottom: 1px solid #333;
+		color: #ddd;
+		font-size: 0.9rem;
+	}
+
+	.leaderboard-table th {
+		background: #252525;
+		font-weight: 600;
+		color: #ccc;
+		text-transform: uppercase;
+		font-size: 0.75rem;
+		letter-spacing: 0.04em;
+	}
+
+	.leaderboard-table tbody tr:last-child td {
+		border-bottom: none;
+	}
+
+	.leaderboard-table tbody tr:hover {
+		background: #252525;
+	}
+
 	.reviews-heading {
 		margin: 0 0 0.5rem;
 		font-size: 0.9rem;
@@ -2964,6 +3288,13 @@
 	.admin-shell.light .btn-impersonate { background: #d0dff5; color: #2255a0; border-color: #5577aa; }
 	.admin-shell.light .btn-impersonate:hover:not(:disabled) { background: #c0d0f0; }
 
+	.admin-shell.light .pipes-input { background: #fff; color: #1a1a1a; border-color: #666; }
+	.admin-shell.light .pipes-input:focus { border-color: #3b7bb5; }
+	.admin-shell.light .btn-pipes-grant { background: #d5eed5; color: #2a7a2a; border-color: #70a070; }
+	.admin-shell.light .btn-pipes-grant:hover:not(:disabled) { background: #c0e0c0; }
+	.admin-shell.light .btn-pipes-revoke { background: #f0dbc0; color: #a05a20; border-color: #b08060; }
+	.admin-shell.light .btn-pipes-revoke:hover:not(:disabled) { background: #e8cba8; }
+
 	/* Perms dropdown */
 	.admin-shell.light .perms-dropdown { background: #fff; border-color: #666; }
 	.admin-shell.light .perms-option { color: #1a1a1a; }
@@ -3065,6 +3396,7 @@
 	.admin-shell.light .review-btn-approve { background: #3a8a4a; }
 	.admin-shell.light .review-btn-reject { background: #b83030; }
 	.admin-shell.light .review-btn-ban { background: #fff; border-color: #b83030; color: #b83030; }
+	.admin-shell.light .review-btn-resync { background: #2a5a8a; }
 
 	/* Review cards */
 	.admin-shell.light .reviews-heading { color: #333; }

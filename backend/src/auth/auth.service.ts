@@ -16,6 +16,15 @@ const EMAIL_RE =
 
 const REFRESH_TOKEN_EXPIRY_MS = 90 * 24 * 60 * 60 * 1000; // 90 days
 
+export const ALLOWED_GENDERS = [
+  'male',
+  'female',
+  'non_binary_other',
+  'not_sure',
+  'prefer_not_to_say',
+] as const;
+export type Gender = (typeof ALLOWED_GENDERS)[number];
+
 @Injectable()
 export class AuthService {
   private readonly logger = new Logger(AuthService.name);
@@ -163,8 +172,8 @@ export class AuthService {
       throw new Error('Invalid userinfo response');
     }
 
-    // 4. Upsert user in DB
-    const user = await this.upsertUser(userinfo);
+    // 4. Upsert user in DB (pass HCA tokens so they're persisted encrypted)
+    const user = await this.upsertUser(userinfo, tokens.access_token, tokens.refresh_token);
 
     // 4b. Check if user is banned
     try {
@@ -208,6 +217,7 @@ export class AuthService {
       slack_id: userinfo.slack_id,
       has_address: user.hasAddress,
       has_birthdate: user.hasBirthdate,
+      gender: user.gender,
     });
 
     return { token, refreshToken, redirectTo };
@@ -245,6 +255,7 @@ export class AuthService {
       slack_id: user.slackId,
       has_address: user.hasAddress,
       has_birthdate: user.hasBirthdate,
+      gender: user.gender,
     });
 
     return { token, refreshToken: newRefreshToken };
@@ -284,6 +295,7 @@ export class AuthService {
       slack_id: user.slackId,
       has_address: user.hasAddress,
       has_birthdate: user.hasBirthdate,
+      gender: user.gender,
       impersonator_uid: adminUid,
       impersonator_name: adminName,
     });
@@ -310,12 +322,42 @@ export class AuthService {
       slack_id: user.slackId,
       has_address: user.hasAddress,
       has_birthdate: user.hasBirthdate,
+      gender: user.gender,
     });
 
     return { token };
   }
 
-  private async upsertUser(userinfo: Record<string, any>): Promise<User> {
+  async updateGender(
+    userId: string,
+    gender: Gender,
+  ): Promise<{ token: string }> {
+    const user = await this.userRepo.findOne({ where: { id: userId } });
+    if (!user) throw new Error('User not found');
+
+    user.gender = gender;
+    await this.userRepo.save(user);
+
+    const token = this.jwtService.sign({
+      sub: user.hcaSub,
+      uid: user.id,
+      email: user.email,
+      name: user.name,
+      nickname: user.nickname,
+      slack_id: user.slackId,
+      has_address: user.hasAddress,
+      has_birthdate: user.hasBirthdate,
+      gender: user.gender,
+    });
+
+    return { token };
+  }
+
+  private async upsertUser(
+    userinfo: Record<string, any>,
+    hcaAccessToken?: string,
+    hcaRefreshToken?: string,
+  ): Promise<User> {
     const hasAddress = !!(
       userinfo.address ||
       (Array.isArray(userinfo.addresses) && userinfo.addresses.length > 0)
@@ -335,6 +377,8 @@ export class AuthService {
       user.slackId = userinfo.slack_id;
       user.hasAddress = hasAddress;
       user.hasBirthdate = hasBirthdate;
+      if (hcaAccessToken) user.hcaAccessToken = hcaAccessToken;
+      if (hcaRefreshToken) user.hcaRefreshToken = hcaRefreshToken;
       return this.userRepo.save(user);
     }
 
@@ -349,6 +393,8 @@ export class AuthService {
         slackId: userinfo.slack_id,
         hasAddress,
         hasBirthdate,
+        hcaAccessToken: hcaAccessToken ?? undefined,
+        hcaRefreshToken: hcaRefreshToken ?? undefined,
       });
       return await this.userRepo.save(user);
     } catch (err: any) {
@@ -364,6 +410,8 @@ export class AuthService {
         user.slackId = userinfo.slack_id;
         user.hasAddress = hasAddress;
         user.hasBirthdate = hasBirthdate;
+        if (hcaAccessToken) user.hcaAccessToken = hcaAccessToken;
+        if (hcaRefreshToken) user.hcaRefreshToken = hcaRefreshToken;
         return this.userRepo.save(user);
       }
       throw err;

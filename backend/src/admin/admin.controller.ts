@@ -67,6 +67,26 @@ export class AdminController {
   }
 
   @UseGuards(SuperAdminGuard)
+  @Patch('users/:id/pipes')
+  async adjustPipes(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() body: { delta?: number; reason?: string | null },
+    @Req() req: Request,
+  ) {
+    if (typeof body.delta !== 'number' || !Number.isInteger(body.delta) || body.delta === 0) {
+      throw new BadRequestException('delta must be a non-zero integer');
+    }
+    const MAX_DELTA = 100_000;
+    if (Math.abs(body.delta) > MAX_DELTA) {
+      throw new BadRequestException(`delta must be between -${MAX_DELTA} and ${MAX_DELTA}`);
+    }
+    const reason = typeof body.reason === 'string' ? body.reason.trim().slice(0, 200) : null;
+    const adminId = (req as any).user?.uid;
+    const result = await this.adminService.adjustPipes(id, body.delta, reason || null, adminId);
+    return { success: true, pipes: result.pipes };
+  }
+
+  @UseGuards(SuperAdminGuard)
   @Post('users/:id/impersonate')
   async impersonateUser(
     @Param('id', ParseUUIDPipe) id: string,
@@ -87,18 +107,47 @@ export class AdminController {
     return this.authService.issueImpersonationToken(id, adminUid, adminName);
   }
 
+  @UseGuards(SuperAdminGuard)
+  @Get('stats/dau')
+  getDailyActiveUsers() {
+    return this.adminService.getDailyActiveUsers();
+  }
+
+  @UseGuards(SuperAdminGuard)
+  @Get('stats/dau/history')
+  getDauHistory() {
+    return this.adminService.getDauHistory();
+  }
+
+  @UseGuards(SuperAdminGuard)
+  @Get('stats/signups')
+  getSignupsHistory() {
+    return this.adminService.getSignupsHistory();
+  }
+
+  @UseGuards(SuperAdminGuard)
+  @Get('stats/funnel')
+  getUserFunnel() {
+    return this.adminService.getUserFunnel();
+  }
+
   // ── Projects ──
 
   @UseGuards(ReviewerGuard)
   @Get('projects')
-  listProjects() {
-    return this.adminService.listAllProjects();
+  listProjects(@Req() req: Request) {
+    const isSuperAdmin = (req as any).user?.perms === 'Super Admin';
+    return this.adminService.listAllProjects(isSuperAdmin);
   }
 
   @UseGuards(ReviewerGuard)
   @Get('projects/:id/hackatime')
-  getProjectHackatime(@Param('id', ParseUUIDPipe) id: string) {
-    return this.adminService.getProjectHackatime(id);
+  getProjectHackatime(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Req() req: Request,
+  ) {
+    const isSuperAdmin = (req as any).user?.perms === 'Super Admin';
+    return this.adminService.getProjectHackatime(id, isSuperAdmin);
   }
 
   @UseGuards(ReviewerGuard)
@@ -119,7 +168,25 @@ export class AdminController {
     if (!body.status || !validStatuses.includes(body.status)) {
       throw new BadRequestException(`status must be one of: ${validStatuses.join(', ')}`);
     }
-    const reviewerId = (req as any).user?.uid;
+
+    const reviewer = (req as any).user;
+    const reviewerId = reviewer?.uid;
+    const isSuperAdmin = reviewer?.perms === 'Super Admin';
+
+    if (body.status === 'ban' && !isSuperAdmin) {
+      throw new BadRequestException('Only Super Admins can ban users. Flag this project in your internal note and ping Euan.');
+    }
+
+    const HOURS_CAP = 500;
+    for (const [field, value] of [
+      ['overrideHours', body.overrideHours] as const,
+      ['internalHours', body.internalHours] as const,
+    ]) {
+      if (value === undefined || value === null) continue;
+      if (!Number.isFinite(value) || value < 0 || value > HOURS_CAP) {
+        throw new BadRequestException(`${field} must be a finite number between 0 and ${HOURS_CAP}`);
+      }
+    }
 
     if (body.status === 'ban') {
       return this.adminService.banAndRejectProject(
@@ -147,6 +214,28 @@ export class AdminController {
   @Get('projects/:id/reviews')
   getProjectReviews(@Param('id', ParseUUIDPipe) id: string) {
     return this.adminService.getProjectReviews(id, true);
+  }
+
+  @UseGuards(ReviewerGuard)
+  @Get('review-leaderboard')
+  getReviewLeaderboard(@Req() req: Request) {
+    const query = (req as any).query ?? {};
+    const win = (query.window as string) ?? '7d';
+    const validWindows = ['24h', '7d', '30d', 'all'];
+    if (!validWindows.includes(win)) {
+      throw new BadRequestException(`window must be one of: ${validWindows.join(', ')}`);
+    }
+    return this.adminService.getReviewLeaderboard(win as '24h' | '7d' | '30d' | 'all');
+  }
+
+  @UseGuards(SuperAdminGuard)
+  @Post('projects/:id/resync-airtable')
+  async resyncAirtable(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Req() req: Request,
+  ) {
+    const reviewerId = (req as any).user?.uid;
+    return this.adminService.resyncProjectToAirtable(id, reviewerId);
   }
 
   // ── News CRUD ──
@@ -195,6 +284,7 @@ export class AdminController {
   async createShopItem(@Body() body: {
     name?: string;
     description?: string;
+    detailedDescription?: string | null;
     imageUrl?: string;
     priceHours?: number;
     stock?: number | null;
@@ -215,6 +305,7 @@ export class AdminController {
     return this.adminService.createShopItem({
       name: body.name,
       description: body.description,
+      detailedDescription: body.detailedDescription,
       imageUrl: body.imageUrl,
       priceHours: body.priceHours,
       stock: body.stock,
@@ -245,6 +336,7 @@ export class AdminController {
     @Body() body: {
       name?: string;
       description?: string;
+      detailedDescription?: string | null;
       imageUrl?: string;
       priceHours?: number;
       stock?: number | null;

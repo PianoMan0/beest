@@ -56,10 +56,31 @@ export class ProjectsController {
     for (const p of projects) {
       const names = p.hackatimeProjectName ?? [];
       const status = p.status ?? 'unshipped';
+
+      let currentHours = 0;
       for (const name of names) {
-        if (perProject[name]) {
-          byStatus[status] = (byStatus[status] ?? 0) + perProject[name];
-        }
+        if (perProject[name]) currentHours += perProject[name];
+      }
+      if (currentHours <= 0) continue;
+
+      // overrideHours is the hours locked in at the last approval (user-facing, drives pipes).
+      // Anything beyond that is post-approval work that hasn't been approved yet.
+      // When a project is in changes_needed, any prior approval has been revoked
+      // (pipes are clawed back in admin.service.ts#reviewProject), so those hours
+      // must not count as approved — they belong to the changes_needed bucket.
+      const approvedCountsTowardApproved =
+        status === 'approved' || status === 'unreviewed';
+      const approvedSoFar = approvedCountsTowardApproved
+        ? Math.min(p.overrideHours ?? 0, currentHours)
+        : 0;
+      const remainder = Math.max(0, currentHours - approvedSoFar);
+
+      if (approvedSoFar > 0) {
+        byStatus['approved'] = (byStatus['approved'] ?? 0) + approvedSoFar;
+      }
+      if (remainder > 0) {
+        const bucket = status === 'approved' ? 'unshipped' : status;
+        byStatus[bucket] = (byStatus[bucket] ?? 0) + remainder;
       }
     }
 

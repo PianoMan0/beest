@@ -39,6 +39,9 @@ export class User {
   @Column({ nullable: true, name: 'hackatime_user_id' })
   hackatimeUserId: string;
 
+  @Column({ nullable: true })
+  gender: string;
+
   @Column({
     nullable: true,
     name: 'hackatime_token',
@@ -46,6 +49,22 @@ export class User {
     transformer: encryptedTransformer,
   })
   hackatimeToken: string;
+
+  @Column({
+    nullable: true,
+    name: 'hca_access_token',
+    type: 'text',
+    transformer: encryptedTransformer,
+  })
+  hcaAccessToken: string;
+
+  @Column({
+    nullable: true,
+    name: 'hca_refresh_token',
+    type: 'text',
+    transformer: encryptedTransformer,
+  })
+  hcaRefreshToken: string;
 
   @Column({ type: 'integer', default: 0 })
   pipes: number;

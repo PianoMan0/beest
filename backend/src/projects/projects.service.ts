@@ -10,6 +10,7 @@ import { fetchWithTimeout } from '../fetch.util';
 import { AuditLogService } from '../audit-log/audit-log.service';
 import { HackatimeService } from '../hackatime/hackatime.service';
 import { RsvpService } from '../rsvp/rsvp.service';
+import { IdentityService } from '../identity/identity.service';
 import { CreateProjectDto } from './create-project.dto';
 import { UpdateProjectDto } from './update-project.dto';
 
@@ -41,6 +42,7 @@ export class ProjectsService {
     private auditLogService: AuditLogService,
     private hackatimeService: HackatimeService,
     private rsvpService: RsvpService,
+    private identityService: IdentityService,
     @InjectRepository(Project)
     private projectRepo: Repository<Project>,
     @InjectRepository(Comment)
@@ -138,6 +140,49 @@ export class ProjectsService {
     return safe;
   }
 
+  /**
+   * Returns the size of the review queue (all projects with status='unreviewed')
+   * and this project's position within it, where 1 = next to be reviewed.
+   * Position is derived from the project's latest 'unreviewed' submission's
+   * createdAt — that's the moment the project entered the queue. Projects
+   * with no submission row fall back to ranking last.
+   */
+  async getQueuePosition(projectId: string, userId: string) {
+    const project = await this.projectRepo.findOne({
+      where: { id: projectId, userId },
+      select: ['id', 'status'],
+    });
+    if (!project) throw new NotFoundException('Project not found');
+    if (project.status !== 'unreviewed') {
+      throw new BadRequestException('Project is not awaiting review');
+    }
+
+    const total = await this.projectRepo.count({ where: { status: 'unreviewed' } });
+
+    const sub = await this.submissionRepo.findOne({
+      where: { projectId, status: 'unreviewed' },
+      order: { createdAt: 'DESC' },
+      select: ['createdAt'],
+    });
+    if (!sub) return { total, position: total };
+
+    const result: { count: number }[] = await this.projectRepo.query(
+      `
+        SELECT COUNT(*)::int AS count
+        FROM projects p
+        WHERE p.status = 'unreviewed'
+          AND (
+            SELECT MAX(s.created_at)
+            FROM submissions s
+            WHERE s.project_id = p.id AND s.status = 'unreviewed'
+          ) <= $1
+      `,
+      [sub.createdAt],
+    );
+    const position = Number(result[0]?.count ?? total);
+    return { total, position };
+  }
+
   async findByUser(userId: string) {
     const projects = await this.projectRepo.find({
       where: { userId },
@@ -158,11 +203,50 @@ export class ProjectsService {
         'otherHcProgram',
         'aiUse',
         'overrideHours',
+        'pipesGranted',
         'createdAt',
         'updatedAt',
       ],
     });
     return projects;
+  }
+
+  /**
+   * Returns the average time-to-first-review per project type, in seconds.
+   * Used by the public shipping guide so submitters know how long each
+   * project type usually takes to review.
+   *
+   * Common rejection reasons are not computed here — they are paraphrased by
+   * hand from a snapshot of feedback and embedded statically in the guide
+   * page so we never quote reviewers verbatim.
+   */
+  async getReviewStats(): Promise<
+    { projectType: string; avgSeconds: number; sampleCount: number }[]
+  > {
+    const rows: { project_type: string; avg_seconds: string; sample_count: string }[] =
+      await this.projectRepo.query(`
+        WITH first_reviews AS (
+          SELECT submission_id, MIN(created_at) AS first_review_at
+          FROM project_reviews
+          WHERE submission_id IS NOT NULL
+          GROUP BY submission_id
+        )
+        SELECT
+          p.project_type AS project_type,
+          AVG(EXTRACT(EPOCH FROM (fr.first_review_at - s.created_at))) AS avg_seconds,
+          COUNT(*) AS sample_count
+        FROM first_reviews fr
+        JOIN submissions s ON s.id = fr.submission_id
+        JOIN projects p ON p.id = s.project_id
+        WHERE fr.first_review_at >= s.created_at
+        GROUP BY p.project_type
+      `);
+
+    return rows.map((r) => ({
+      projectType: r.project_type,
+      avgSeconds: Number(r.avg_seconds),
+      sampleCount: Number(r.sample_count),
+    }));
   }
 
   /**
@@ -197,11 +281,13 @@ export class ProjectsService {
         'project.demoUrl',
         'project.hackatimeProjectName',
         'project.overrideHours',
+        'project.createdAt',
         'user.hcaSub',
         'user.name',
         'user.nickname',
         'user.hackatimeToken',
       ])
+      .orderBy('project.createdAt', 'DESC')
       .getMany();
 
     const results = await Promise.allSettled(
@@ -247,9 +333,19 @@ export class ProjectsService {
   /**
    * Returns approved projects grouped by user, including user name info.
    * Only includes users who have a hackatime token (needed to fetch hours).
+   * Each entry exposes the per-project hackatime names and overrideHours so
+   * callers can compute approved (capped) hours, not raw Hackatime totals.
    */
   async findApprovedProjectsGroupedByUser(): Promise<
-    Map<string, { hcaSub: string; name: string | null; nickname: string | null; projectNames: string[] }>
+    Map<
+      string,
+      {
+        hcaSub: string;
+        name: string | null;
+        nickname: string | null;
+        projects: { hackatimeProjectNames: string[]; overrideHours: number }[];
+      }
+    >
   > {
     const projects = await this.projectRepo
       .createQueryBuilder('project')
@@ -260,6 +356,7 @@ export class ProjectsService {
       .select([
         'project.id',
         'project.hackatimeProjectName',
+        'project.overrideHours',
         'user.id',
         'user.hcaSub',
         'user.name',
@@ -269,12 +366,17 @@ export class ProjectsService {
 
     const grouped = new Map<
       string,
-      { hcaSub: string; name: string | null; nickname: string | null; projectNames: string[] }
+      {
+        hcaSub: string;
+        name: string | null;
+        nickname: string | null;
+        projects: { hackatimeProjectNames: string[]; overrideHours: number }[];
+      }
     >();
 
     for (const p of projects) {
       const userId = p.user.id;
-      const names = (p.hackatimeProjectName ?? []).filter((n) => !!n);
+      const names = [...new Set((p.hackatimeProjectName ?? []).filter((n) => !!n))];
       if (names.length === 0) continue;
 
       if (!grouped.has(userId)) {
@@ -282,15 +384,13 @@ export class ProjectsService {
           hcaSub: p.user.hcaSub,
           name: p.user.name,
           nickname: p.user.nickname,
-          projectNames: [],
+          projects: [],
         });
       }
-      grouped.get(userId)!.projectNames.push(...names);
-    }
-
-    // Deduplicate project names per user
-    for (const entry of grouped.values()) {
-      entry.projectNames = [...new Set(entry.projectNames)];
+      grouped.get(userId)!.projects.push({
+        hackatimeProjectNames: names,
+        overrideHours: p.overrideHours ?? 0,
+      });
     }
 
     return grouped;
@@ -374,6 +474,7 @@ export class ProjectsService {
         if (project.status !== 'unshipped' && project.status !== 'changes_needed') {
           throw new BadRequestException('Invalid status transition');
         }
+        await this.requireShipEligibility(userId);
         // Re-verify Hackatime account ownership at submit time, even if the
         // linked names weren't touched in this request. Catches projects that
         // were created before this guard existed.
@@ -397,11 +498,13 @@ export class ProjectsService {
 
     if (dto.status === 'unreviewed') {
       // Create a submission record for this review request
+      const reviewerNote = this.validateOptionalString(dto.reviewerNote, 'reviewerNote', 1000);
       const submission = this.submissionRepo.create({
         projectId: project.id,
         userId,
         changeDescription: null,
         minHoursConfirmed: false,
+        reviewerNote,
         status: 'unreviewed',
       });
       await this.submissionRepo.save(submission);
@@ -467,6 +570,7 @@ export class ProjectsService {
     hcaSub: string,
     changeDescription: string,
     minHoursConfirmed: boolean,
+    reviewerNote?: string | null,
     impersonatorName?: string,
   ) {
     const project = await this.projectRepo.findOne({
@@ -476,6 +580,8 @@ export class ProjectsService {
     if (project.status !== 'approved') {
       throw new BadRequestException('Only approved projects can be resubmitted');
     }
+
+    await this.requireShipEligibility(userId);
 
     // Validate inputs
     const cleanDesc = this.requireString(changeDescription, 'changeDescription', 500);
@@ -512,11 +618,13 @@ export class ProjectsService {
     await this.projectRepo.save(project);
 
     // Create a submission record
+    const cleanReviewerNote = this.validateOptionalString(reviewerNote, 'reviewerNote', 1000);
     const submission = this.submissionRepo.create({
       projectId: project.id,
       userId,
       changeDescription: cleanDesc,
       minHoursConfirmed: true,
+      reviewerNote: cleanReviewerNote,
       status: 'unreviewed',
     });
     await this.submissionRepo.save(submission);
@@ -675,6 +783,30 @@ export class ProjectsService {
 
     await this.commentRepo.remove(comment);
     return { deleted: true };
+  }
+
+  /**
+   * Backend gate for shipping a project. Live call to identity.hackclub.com so a
+   * freshly verified user can ship without logging out and back in.
+   *
+   * Address/birthdate are intentionally NOT enforced here: an identity-verified
+   * user has a birthdate on file by construction, and missing addresses get
+   * caught at fulfillment. The frontend still surfaces the soft prompt for both.
+   */
+  private async requireShipEligibility(userId: string): Promise<void> {
+    const user = await this.userRepo.findOne({
+      where: { id: userId },
+      select: ['email', 'slackId'],
+    });
+    const verified = await this.identityService.isVerified({
+      slackId: user?.slackId,
+      email: user?.email,
+    });
+    if (!verified) {
+      throw new ForbiddenException(
+        'Verify your identity at https://auth.hackclub.com/verifications/document before shipping a project.',
+      );
+    }
   }
 
   /* ------------------------------------------------------------------ */

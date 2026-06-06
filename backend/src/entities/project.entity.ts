@@ -12,6 +12,7 @@ import { User } from './user.entity';
 export const VALID_PROJECT_STATUSES = [
   'unshipped',
   'unreviewed',
+  'fraud_pending',
   'changes_needed',
   'approved',
 ] as const;
@@ -27,6 +28,9 @@ export const VALID_PROJECT_TYPES = [
   'python',
   'android',
   'ios',
+  'hardware',
+  'cad',
+  'other',
 ] as const;
 
 export type ProjectType = (typeof VALID_PROJECT_TYPES)[number];
@@ -86,7 +90,7 @@ export class Project {
   @Column({ type: 'real', name: 'internal_hours', nullable: true })
   internalHours: number | null;
 
-  @Column({ name: 'is_update', default: false })
+  @Column({ type: 'boolean', name: 'is_update', default: false })
   isUpdate: boolean;
 
   @Column({ type: 'varchar', name: 'other_hc_program', length: 255, nullable: true })

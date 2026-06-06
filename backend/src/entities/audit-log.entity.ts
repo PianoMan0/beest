@@ -15,6 +15,7 @@ export const AUDIT_ACTIONS = [
   'project_deleted',
   'hackatime_connected',
   'hackatime_ownership_failed',
+  'ban_reverted',
   'rsvp_submitted',
   'admin_ban',
   'admin_perms_change',
@@ -24,6 +25,12 @@ export const AUDIT_ACTIONS = [
   'admin_resync_airtable',
   'shop_purchase',
   'order_fulfilled',
+  'order_refunded',
+  'order_merged',
+  'devlog_created',
+  'devlog_deleted',
+  'hcb_connected',
+  'card_grant_issued',
 ] as const;
 
 export type AuditAction = (typeof AUDIT_ACTIONS)[number];

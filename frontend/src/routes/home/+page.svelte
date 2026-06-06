@@ -8,12 +8,17 @@
  #cbc1ae - Beige
  #809fb7 - Light Steel Blue
  #e6f4fe - Light Cyan
+ #9a9285 - Warm Granite (devlogs accent)
+ #52504a - Basalt       (devlogs section bg)
  #ffffff - White
 -->
 
 <script lang="ts">
   import { onMount } from 'svelte';
+  import { goto, pushState } from '$app/navigation';
+  import { page } from '$app/state';
   import confetti from 'canvas-confetti';
+  import { formatLocal } from '$lib/utils/formatDate';
 
   // Portal action: moves a node to document.body so its position:fixed
   // escapes any ancestor containing-block (.main has filter: saturate which
@@ -29,16 +34,47 @@
   }
 
   let { data } = $props();
+  const initialEvents = data.events ?? [];
 
-  let mobileWarningDismissed = $state(false);
-  let activeSection = $state('projects');
+  function slackUserUrl(slackId: string) {
+    return `https://hackclub.enterprise.slack.com/team/${encodeURIComponent(slackId)}`;
+  }
+
+  const sectionRoutes: Record<string, string> = {
+    projects: '/projects',
+    shop: '/shop',
+    events: '/events',
+    explore: '/explore',
+    leaderboard: '/leaderboard',
+    faq: '/faq',
+    me: '/me',
+    devlogs: '/devlogs',
+    tutorial: '/tutorial'
+  };
+  const pathSections: Record<string, string> = {
+    '/home': 'projects',
+    '/projects': 'projects',
+    '/shop': 'shop',
+    '/events': 'events',
+    '/explore': 'explore',
+    '/leaderboard': 'leaderboard',
+    '/faq': 'faq',
+    '/me': 'me',
+    '/devlogs': 'devlogs'
+  };
+  const sectionFromPath = (pathname: string) => pathSections[pathname] ?? 'projects';
+
+  let activeSection = $state(sectionFromPath(page.url.pathname));
   let tileLoaded = $state(false);
   let customCursorEnabled = $state(typeof localStorage !== 'undefined' ? localStorage.getItem('customCursor') !== 'off' : true);
+  const EVENT_START = new Date('2026-08-16T00:00:00+02:00').getTime();
+  let eventCountdown = $state({ days: 0, hours: 0, minutes: 0, seconds: 0, live: false });
   let creatingProject = $state(false);
   let editingProject = $state<any>(null);
   type ProjectReview = { id: string; status: 'approved' | 'changes_needed'; feedback: string | null; reviewerName: string | null; createdAt: string };
   let editingProjectReviews = $state<ProjectReview[]>([]);
   let editingProjectReviewsLoading = $state(false);
+  let editingProjectQueue = $state<{ total: number; position: number } | null>(null);
 
   let projectName = $state('');
   let projectDesc = $state('');
@@ -64,8 +100,12 @@
   let formError = $state('');
   let auditLog = $state<{ action: string; label: string; createdAt: string }[]>([]);
   let newsItems = $state<{ id: string; text: string; displayDate: string }[]>([]);
+  let eventItems = $state<{ id: string; title: string; description: string | null; hostedBy: string | null; hostedByName: string | null; hostedBySlackId: string | null; startAt: string; endAt: string | null; location: string | null; url: string | null }[]>(initialEvents);
   let leaderboard = $state<{ name: string; hours: number }[]>([]);
   let leaderboardLoading = $state(true);
+  let leaderboardTotal = $state(0);
+  let leaderboardLoadingMore = $state(false);
+  const LEADERBOARD_PAGE_SIZE = 10;
   let exploreProjects = $state<{ id: string; name: string; description: string; projectType: string; screenshot1Url: string | null; screenshot2Url: string | null; codeUrl: string | null; demoUrl: string | null; hours: number; builderName: string }[]>([]);
   let exploreLoading = $state(true);
 
@@ -83,25 +123,96 @@
   let stickerLink = $state<string | null>(null);
 
   // Shop state
-  type ShopItemType = { id: string; name: string; description: string; detailedDescription: string | null; imageUrl: string; priceHours: number; stock: number | null; sortOrder: number; estimatedShip: string | null };
+  type ShopItemType = { id: string; name: string; description: string; detailedDescription: string | null; imageUrl: string; priceHours: number; stock: number | null; sortOrder: number; isFeatured: boolean; estimatedShip: string | null };
   let shopItems = $state<ShopItemType[]>([]);
   let shopLoading = $state(false);
   let shopLoaded = $state(false);
   let selectedShopItem = $state<ShopItemType | null>(null);
   let shopQuantity = $state(1);
+  let shopQuantityText = $state('1');
   let userPipes = $state(0);
   let purchaseLoading = $state(false);
   let purchaseError = $state('');
   let purchaseSuccess = $state('');
+
+  // User's own orders (shown at the bottom of the shop)
+  type UserOrderType = { id: string; itemName: string; quantity: number; pipesSpent: number; status: string; createdAt: string };
+  let userOrders = $state<UserOrderType[]>([]);
+  let userOrdersLoading = $state(false);
+  let refundingOrderId = $state<string | null>(null);
+  let refundError = $state('');
 
   // Fulfillment updates state
   type FulfillmentUpdateType = { id: string; orderId: string; itemName: string; message: string; isRead: boolean; createdAt: string };
   let fulfillmentUpdates = $state<FulfillmentUpdateType[]>([]);
   let fulfillmentLoading = $state(false);
   let unreadCount = $state(0);
+
+  // Devlogs state
+  type DevlogType = { id: string; projectId: string | null; title: string; text: string; imageUrls: string[]; createdAt: string };
+  let devlogs = $state<DevlogType[]>([]);
+  let devlogsLoading = $state(false);
+  let devlogFormOpen = $state(false);
+  let devlogLightbox = $state<string | null>(null);
+
+  // Show the create form upfront when there are no devlogs yet; otherwise
+  // keep it tucked behind a "New devlog" button until the user opens it.
+  let devlogFormVisible = $derived(devlogs.length === 0 || devlogFormOpen);
+
+  function openDevlogLightbox(url: string) {
+    devlogLightbox = url;
+  }
+  function closeDevlogLightbox() {
+    devlogLightbox = null;
+  }
+  function onDevlogLightboxKey(e: KeyboardEvent) {
+    if (e.key === 'Escape') closeDevlogLightbox();
+  }
+  let devlogTitle = $state('');
+  let devlogText = $state('');
+  let devlogProjectId = $state<string>('');
+  let devlogFiles = $state<(File | null)[]>([null, null, null, null]);
+  let devlogPreviews = $state<string[]>(['', '', '', '']);
+  let devlogSubmitting = $state(false);
+  let devlogError = $state('');
+  const DEVLOG_TITLE_MAX = 120;
+  const DEVLOG_TEXT_MAX = 5000;
+  const DEVLOG_MAX_IMAGES = 4;
   let nicknameInput = $state(data.user.nickname ?? '');
   let nicknameSaving = $state(false);
   let genderSaving = $state(false);
+
+  // One-time "here for the hackathon or the shop?" prompt. Stays up until the
+  // user picks an option (recorded in Airtable); not dismissable otherwise.
+  let showIntent = $state(data.needsIntent === true);
+  let intentSaving = $state(false);
+  let intentError = $state('');
+  let intentThanked = $state(false); // swap to the thank-you message after a successful pick
+  let intentFadingOut = $state(false); // triggers the overlay fade-out
+  async function chooseIntent(choice: 'Hackathon' | 'Shop' | 'Browsing' | 'Both') {
+    if (intentSaving) return;
+    intentSaving = true;
+    intentError = '';
+    try {
+      const res = await fetch('/api/auth/intent', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ choice })
+      });
+      if (res.ok) {
+        // Show a brief thank-you, then fade the overlay out and remove it.
+        intentThanked = true;
+        setTimeout(() => { intentFadingOut = true; }, 1100);
+        setTimeout(() => { showIntent = false; }, 1600);
+      } else {
+        intentError = 'Could not save — please try again.';
+      }
+    } catch {
+      intentError = 'Could not save — please try again.';
+    } finally {
+      intentSaving = false;
+    }
+  }
   const GENDER_OPTIONS: { value: string; label: string }[] = [
     { value: 'male', label: 'Male' },
     { value: 'female', label: 'Female' },
@@ -160,16 +271,23 @@
   let canConfirmReview = $derived(checkOpenSource && checkDemoable && checkReadme && checkHackatime && checkStartedOrUpdated && !submitting);
   let reviewSubmitted = $state(false);
   let reviewSubmittedName = $state('');
+  let reviewerNote = $state('');
 
   // Resubmit state (approved projects)
   let resubmitChangeDesc = $state('');
   let resubmitMinHours = $state(false);
+  let resubmitReviewerNote = $state('');
   let resubmitLoading = $state(false);
 
   // Shipping eligibility
-  let shippingCheck = $state<{ hasAddress: boolean; hasBirthdate: boolean; eligible: boolean; addressPortalUrl: string } | null>(null);
+  let shippingCheck = $state<{ hasAddress: boolean; hasBirthdate: boolean; identityVerified: boolean; eligible: boolean; addressPortalUrl: string; identityPortalUrl: string } | null>(null);
   let shippingCheckLoading = $state(false);
   let showShippingPrompt = $state(false);
+  let identityPollAttempts = $state(0);
+  let identityPollExhausted = $state(false);
+  let identityPollTimer: ReturnType<typeof setTimeout> | null = null;
+  const IDENTITY_POLL_INTERVAL_MS = 5000;
+  const IDENTITY_POLL_MAX_ATTEMPTS = 60; // ~5 minutes
 
   function resetForm() {
     creatingProject = false;
@@ -200,11 +318,27 @@
     checkReadme = false;
     checkHackatime = false;
     checkStartedOrUpdated = false;
+    reviewerNote = '';
     resubmitChangeDesc = '';
     resubmitMinHours = false;
+    resubmitReviewerNote = '';
     resubmitLoading = false;
     editingProjectReviews = [];
     editingProjectReviewsLoading = false;
+    editingProjectQueue = null;
+  }
+
+  async function fetchProjectQueue(projectId: string) {
+    editingProjectQueue = null;
+    try {
+      const res = await fetch(`/api/projects/${projectId}/queue-position`);
+      if (res.ok) {
+        const data = await res.json();
+        if (typeof data?.total === 'number' && typeof data?.position === 'number') {
+          editingProjectQueue = { total: data.total, position: data.position };
+        }
+      }
+    } catch { /* silent */ }
   }
 
   async function fetchProjectReviews(projectId: string) {
@@ -239,6 +373,7 @@
         body: JSON.stringify({
           changeDescription: resubmitChangeDesc.trim(),
           minHoursConfirmed: resubmitMinHours,
+          reviewerNote: resubmitReviewerNote.trim() || null,
         })
       });
       const data = await res.json().catch(() => ({}));
@@ -294,6 +429,9 @@
     resetForm();
     editingProject = project;
     fetchProjectReviews(project.id);
+    if (project.status === 'unreviewed') {
+      fetchProjectQueue(project.id);
+    }
     projectName = project.name ?? '';
     projectDesc = project.description ?? '';
     projectType = project.projectType ?? '';
@@ -369,14 +507,30 @@
   async function fetchLeaderboard() {
     leaderboardLoading = true;
     try {
-      const res = await fetch('/api/leaderboard');
+      const res = await fetch(`/api/leaderboard?limit=${LEADERBOARD_PAGE_SIZE}&offset=0`);
       if (res.ok) {
         const data = await res.json();
         leaderboard = Array.isArray(data.leaderboard) ? data.leaderboard : [];
         totalBuilders = data.totalUsers ?? 0;
+        leaderboardTotal = typeof data.total === 'number' ? data.total : leaderboard.length;
       }
     } catch { /* silent */ }
     leaderboardLoading = false;
+  }
+
+  async function loadMoreLeaderboard() {
+    if (leaderboardLoadingMore || leaderboard.length >= leaderboardTotal) return;
+    leaderboardLoadingMore = true;
+    try {
+      const res = await fetch(`/api/leaderboard?limit=${LEADERBOARD_PAGE_SIZE}&offset=${leaderboard.length}`);
+      if (res.ok) {
+        const data = await res.json();
+        const next = Array.isArray(data.leaderboard) ? data.leaderboard : [];
+        leaderboard = [...leaderboard, ...next];
+        if (typeof data.total === 'number') leaderboardTotal = data.total;
+      }
+    } catch { /* silent */ }
+    leaderboardLoadingMore = false;
   }
 
   async function fetchExploreProjects() {
@@ -565,6 +719,8 @@
         shippingCheck = await res.json();
         if (!shippingCheck?.eligible) {
           showShippingPrompt = true;
+          identityPollAttempts = 0;
+          identityPollExhausted = false;
           return false;
         }
         return true;
@@ -572,6 +728,67 @@
     } catch { /* silent */ }
     shippingCheckLoading = false;
     return true; // don't block on network errors
+  }
+
+  /**
+   * Re-fetches /shipping-eligibility once. Used by the auto-poll while the
+   * prompt is open and by the manual "check now" button after the auto-poll
+   * times out. The backend's identity check is live, so as soon as HCA
+   * approves the document this returns true.
+   */
+  async function refreshShippingEligibility(): Promise<void> {
+    try {
+      const res = await fetch('/api/auth/shipping-eligibility');
+      if (res.ok) shippingCheck = await res.json();
+    } catch { /* silent */ }
+  }
+
+  function stopIdentityPolling() {
+    if (identityPollTimer !== null) {
+      clearTimeout(identityPollTimer);
+      identityPollTimer = null;
+    }
+  }
+
+  function scheduleIdentityPoll() {
+    stopIdentityPolling();
+    identityPollTimer = setTimeout(async () => {
+      identityPollTimer = null;
+      identityPollAttempts += 1;
+      await refreshShippingEligibility();
+      // The $effect below decides whether to re-arm based on the fresh state.
+    }, IDENTITY_POLL_INTERVAL_MS);
+  }
+
+  // While the prompt is open and identity is still missing, keep polling.
+  // Stops automatically when the prompt closes, when identity verifies, or
+  // when we hit the attempt cap.
+  $effect(() => {
+    const polling =
+      showShippingPrompt &&
+      shippingCheck != null &&
+      !shippingCheck.identityVerified &&
+      !identityPollExhausted;
+
+    if (!polling) {
+      stopIdentityPolling();
+      return;
+    }
+
+    if (identityPollAttempts >= IDENTITY_POLL_MAX_ATTEMPTS) {
+      identityPollExhausted = true;
+      stopIdentityPolling();
+      return;
+    }
+
+    scheduleIdentityPoll();
+    return () => stopIdentityPolling();
+  });
+
+  async function manualIdentityRecheck() {
+    identityPollAttempts = 0;
+    identityPollExhausted = false;
+    await refreshShippingEligibility();
   }
 
   async function submitForReview() {
@@ -645,7 +862,10 @@
       const res = await fetch(`/api/projects/${reviewProject.id}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ status: 'unreviewed' })
+        body: JSON.stringify({
+          status: 'unreviewed',
+          reviewerNote: reviewerNote.trim() || null,
+        })
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
@@ -709,10 +929,129 @@
   function openShopItem(item: ShopItemType) {
     selectedShopItem = item;
     shopQuantity = 1;
+    shopQuantityText = '1';
+  }
+
+  function setShopQuantity(raw: string) {
+    const digits = raw.replace(/\D/g, '');
+    shopQuantityText = digits;
+    if (digits === '') return;
+    let n = parseInt(digits, 10);
+    if (!Number.isFinite(n) || n < 1) n = 1;
+    const max = selectedShopItem?.stock ?? null;
+    if (max !== null && n > max) {
+      n = max;
+      shopQuantityText = String(n);
+    }
+    shopQuantity = n;
+  }
+
+  function commitShopQuantity() {
+    const n = parseInt(shopQuantityText, 10);
+    if (!Number.isFinite(n) || n < 1) {
+      shopQuantity = 1;
+      shopQuantityText = '1';
+    } else {
+      shopQuantityText = String(shopQuantity);
+    }
   }
 
   function closeShopItem() {
     selectedShopItem = null;
+  }
+
+  // Shop suggestions state
+  type SuggestionType = {
+    id: string;
+    text: string;
+    createdAt: string;
+    authorName: string;
+    isMine: boolean;
+    voteCount: number;
+    votedByUser: boolean;
+  };
+  let suggestionsOpen = $state(false);
+  let suggestions = $state<SuggestionType[]>([]);
+  let suggestionsLoading = $state(false);
+  let newSuggestionText = $state('');
+  let suggestionSubmitting = $state(false);
+  let suggestionError = $state('');
+
+  async function openSuggestions() {
+    suggestionsOpen = true;
+    suggestionsLoading = true;
+    suggestionError = '';
+    try {
+      const res = await fetch('/api/shop/suggestions');
+      if (res.ok) suggestions = await res.json();
+    } catch { /* silent */ }
+    suggestionsLoading = false;
+  }
+
+  function closeSuggestions() {
+    suggestionsOpen = false;
+    newSuggestionText = '';
+    suggestionError = '';
+  }
+
+  async function submitSuggestion() {
+    const text = newSuggestionText.trim();
+    if (!text || suggestionSubmitting) return;
+    suggestionSubmitting = true;
+    suggestionError = '';
+    try {
+      const res = await fetch('/api/shop/suggestions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        suggestionError = data.message || 'Failed to submit';
+      } else {
+        newSuggestionText = '';
+        // Refresh list
+        const listRes = await fetch('/api/shop/suggestions');
+        if (listRes.ok) suggestions = await listRes.json();
+      }
+    } catch {
+      suggestionError = 'Network error — try again';
+    }
+    suggestionSubmitting = false;
+  }
+
+  async function toggleSuggestionVote(s: SuggestionType) {
+    // Optimistic update
+    const prev = { voteCount: s.voteCount, votedByUser: s.votedByUser };
+    const willVote = !s.votedByUser;
+    s.voteCount += willVote ? 1 : -1;
+    s.votedByUser = willVote;
+    suggestions = [...suggestions].sort((a, b) => b.voteCount - a.voteCount || (a.createdAt > b.createdAt ? -1 : 1));
+    try {
+      const res = await fetch(`/api/shop/suggestions/${s.id}/vote`, { method: 'POST' });
+      if (!res.ok) throw new Error('vote failed');
+      const data = await res.json();
+      const idx = suggestions.findIndex(x => x.id === s.id);
+      if (idx >= 0) {
+        suggestions[idx].voteCount = data.voteCount;
+        suggestions[idx].votedByUser = data.votedByUser;
+        suggestions = [...suggestions].sort((a, b) => b.voteCount - a.voteCount || (a.createdAt > b.createdAt ? -1 : 1));
+      }
+    } catch {
+      // Revert
+      s.voteCount = prev.voteCount;
+      s.votedByUser = prev.votedByUser;
+      suggestions = [...suggestions];
+    }
+  }
+
+  async function deleteSuggestion(id: string) {
+    try {
+      const res = await fetch(`/api/shop/suggestions/${id}`, { method: 'DELETE' });
+      if (res.ok) {
+        suggestions = suggestions.filter(s => s.id !== id);
+      }
+    } catch { /* silent */ }
   }
 
 
@@ -720,32 +1059,57 @@
   const faqItems = [
     { q: 'What is Beest?', a: 'Beest is a Hack Club hackathon/event in the Netherlands! Participants qualify by building any project and documenting the process, and those who qualify fly to the Netherlands to build their own beests (mechanical animals!). The event is themed around Strandbeests, a kinetic sculpture developed in the netherlands by Theo Jansen. Participants will have the opportunity to go to a strandbeest exhibit!' },
     { q: 'Who can participate?', a: 'Any teens 13-19 or in high school can participate. We can also provide flight stipends for international students to get to the event.' },
-    { q: 'How much does it cost?', a: 'Beest is completely free to participate in! All costs for the event are covered, including food, accomodation, day-off travel and merchandise. Additionally participants can earn stipends for visa application fees and flight costs.' },
-    { q: 'Where and when does Beest take place?', a: '[TBD]' },
-    { q: 'How will the event run?', a: 'Participants are invited to arrive on July 7th to watch the exhibition of the Beest - then in teams of three they will make walking mechanisms over a week, before exhibiting them on Scheveningen beach.' },
+    { q: 'How much does it cost?', a: 'Beest is completely free to participate in! All costs for the event are covered, including food, accommodation, day-off travel and merchandise. Additionally participants can earn stipends for visa application fees and flight costs.' },
+    { q: 'Where and when does Beest take place?', a: 'Beest runs August 16–21 at Scheveningen Beach in the Netherlands. The Strandbeest exhibition happens during that same window, so participants get to see it as part of the event.' },
+    { q: 'How will the event run?', a: 'Beest runs August 16–21. Participants will watch the Strandbeest exhibition during the event and, in teams of three, make their own walking mechanisms, before exhibiting them on Scheveningen beach on the final day.' },
     { q: 'How do I qualify?', a: "Build an open source coding or hardware project! Anything you can dream up is possible, just make the project you want to exist. Please don't AI generate the project, instead focus on making something fun, silly, useful to you or a project that forces you to learn something new. 40 hours of tracked work will automatically qualify you, and working for additional hours will contribute $8/hr toward your flight cost or visa application fees." },
     { q: 'What should I bring?', a: 'A laptop, a sleeping bag, clothes, a charger, a mobile phone... A more conclusive list will be sent out closer to the event.' },
     { q: 'Do I need prior engineering or building experience?', a: 'No! Hack Club is all about learning by doing, so we welcome builders of all experience levels. We will provide resources and support to help you build your mechanical animal, and we can help you in the #beest channel on Slack!' },
     { q: 'What is a Strandbeest?', a: 'A Strandbeest is a kinetic sculpture that walks using wind power. They are made from lightweight materials like PVC pipe and can range in size from small tabletop models to large structures that can walk on the beach.' },
-    { q: 'I have more questions — how do I get in touch?', a: 'Contact us in the #beest channel on Hack Club Slack or email euan@hackclub.com!' }
+    { q: 'I have more questions — how do I get in touch?', a: 'Contact us in the #beest channel on Hack Club Slack or email beest@hackclub.com!' }
   ];
 
   const navItems = [
-    { id: 'projects', label: 'Projects' },
-    { id: 'shop', label: 'Shop' },
-    { id: 'explore', label: 'Explore' },
-    { id: 'leaderboard', label: 'Leaderboard' },
-    { id: 'faq', label: 'FAQ' },
-    { id: 'me', label: 'Me' },
-    { id: 'tutorial', label: 'Tutorial' }
+    { id: 'projects', label: 'Projects', mobile: true },
+    { id: 'shop', label: 'Shop', mobile: true },
+    { id: 'events', label: 'Events', mobile: true },
+    { id: 'explore', label: 'Explore', mobile: true },
+    { id: 'leaderboard', label: 'Leaderboard', mobile: false },
+    { id: 'faq', label: 'FAQ', mobile: false },
+    { id: 'me', label: 'Me', mobile: true },
+    { id: 'devlogs', label: 'Devlogs', mobile: false },
+    { id: 'tutorial', label: 'Tutorial', mobile: false }
   ];
 
+  function loadSectionData(id: string) {
+    if (id === 'shop') { fetchShopItems(); fetchPipes(); fetchUserOrders(); }
+    if (id === 'me') { fetchFulfillmentUpdates(); markFulfillmentRead(); }
+    if (id === 'devlogs') { fetchDevlogs(); }
+  }
+
   function navigate(id: string) {
-    if (id === 'tutorial') { window.location.href = '/tutorial'; return; }
+    if (id === 'tutorial') { goto('/tutorial'); return; }
     if (creatingProject || editingProject || reviewProject) resetForm();
     activeSection = id;
-    if (id === 'shop') { fetchShopItems(); fetchPipes(); }
-    if (id === 'me') { fetchFulfillmentUpdates(); markFulfillmentRead(); }
+    loadSectionData(id);
+    pushState(sectionRoutes[id] ?? '/projects', {});
+  }
+
+  function updateEventCountdown() {
+    const remaining = EVENT_START - Date.now();
+    if (remaining <= 0) {
+      eventCountdown = { days: 0, hours: 0, minutes: 0, seconds: 0, live: true };
+      return;
+    }
+
+    const totalSeconds = Math.floor(remaining / 1000);
+    eventCountdown = {
+      days: Math.floor(totalSeconds / 86400),
+      hours: Math.floor((totalSeconds % 86400) / 3600),
+      minutes: Math.floor((totalSeconds % 3600) / 60),
+      seconds: totalSeconds % 60,
+      live: false,
+    };
   }
 
   async function fetchPipes() {
@@ -777,6 +1141,8 @@
         userPipes = data.remainingPipes;
         // Refresh shop items (stock may have changed)
         fetchShopItems();
+        // Refresh the user's orders list (new order appears at the bottom of the shop)
+        fetchUserOrders();
         // Refresh unread count
         fetchUnreadCount();
         setTimeout(() => { closeShopItem(); purchaseSuccess = ''; }, 2000);
@@ -787,6 +1153,40 @@
     purchaseLoading = false;
   }
 
+  async function fetchUserOrders() {
+    userOrdersLoading = true;
+    try {
+      const res = await fetch('/api/shop/orders');
+      if (res.ok) userOrders = await res.json();
+    } catch { /* silent */ }
+    userOrdersLoading = false;
+  }
+
+  async function refundOrder(order: UserOrderType) {
+    if (refundingOrderId) return;
+    if (!confirm(`Refund ${order.quantity}x ${order.itemName}? You'll get ${order.pipesSpent} Pipes back.`)) return;
+    refundingOrderId = order.id;
+    refundError = '';
+    try {
+      const res = await fetch(`/api/shop/orders/${order.id}/refund`, { method: 'POST' });
+      const data = await res.json().catch(() => null);
+      if (res.ok) {
+        userOrders = userOrders.filter((o) => o.id !== order.id);
+        if (typeof data?.refundedPipes === 'number') {
+          userPipes += data.refundedPipes;
+        } else {
+          fetchPipes();
+        }
+        fetchShopItems();
+      } else {
+        refundError = data?.message || 'Refund failed';
+      }
+    } catch {
+      refundError = 'Network error. Try again.';
+    }
+    refundingOrderId = null;
+  }
+
   async function fetchFulfillmentUpdates() {
     fulfillmentLoading = true;
     try {
@@ -794,6 +1194,116 @@
       if (res.ok) fulfillmentUpdates = await res.json();
     } catch { /* silent */ }
     fulfillmentLoading = false;
+  }
+
+  /* ────────────────  Devlogs  ──────────────── */
+
+  async function fetchDevlogs() {
+    devlogsLoading = true;
+    try {
+      const res = await fetch('/api/devlogs');
+      if (res.ok) devlogs = await res.json();
+    } catch { /* silent */ }
+    devlogsLoading = false;
+  }
+
+  function handleDevlogImage(e: Event) {
+    const input = e.target as HTMLInputElement;
+    const file = input.files?.[0];
+    if (!file) return;
+    if (!['image/png', 'image/jpeg', 'image/gif', 'image/webp'].includes(file.type)) {
+      devlogError = 'Image must be a PNG, JPEG, GIF, or WebP';
+      input.value = '';
+      return;
+    }
+    const idx = devlogPreviews.findIndex((p) => p === '');
+    if (idx === -1) {
+      devlogError = `Up to ${DEVLOG_MAX_IMAGES} images per devlog`;
+      input.value = '';
+      return;
+    }
+    devlogFiles[idx] = file;
+    devlogPreviews[idx] = URL.createObjectURL(file);
+    devlogError = '';
+    input.value = '';
+  }
+
+  function removeDevlogImage(idx: number) {
+    devlogFiles[idx] = null;
+    devlogPreviews[idx] = '';
+    // Compact the arrays so newly added images fill from the start.
+    devlogFiles = [...devlogFiles.filter((f) => f !== null), null, null, null, null].slice(0, DEVLOG_MAX_IMAGES);
+    devlogPreviews = [...devlogPreviews.filter((p) => p !== ''), '', '', '', ''].slice(0, DEVLOG_MAX_IMAGES);
+  }
+
+  function resetDevlogForm() {
+    devlogTitle = '';
+    devlogText = '';
+    devlogProjectId = '';
+    devlogFiles = [null, null, null, null];
+    devlogPreviews = ['', '', '', ''];
+    devlogError = '';
+  }
+
+  async function submitDevlog() {
+    if (devlogSubmitting) return;
+    const trimmedTitle = devlogTitle.trim();
+    const trimmed = devlogText.trim();
+    if (!trimmedTitle) {
+      devlogError = 'Give your devlog a short title';
+      return;
+    }
+    if (!trimmed) {
+      devlogError = 'Write something for your devlog first';
+      return;
+    }
+    if (!devlogProjectId) {
+      devlogError = 'Pick the project this devlog is for';
+      return;
+    }
+    devlogSubmitting = true;
+    devlogError = '';
+    try {
+      const images: string[] = [];
+      for (const file of devlogFiles) {
+        if (file) images.push(await fileToDataUri(file));
+      }
+      const res = await fetch('/api/devlogs', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          title: trimmedTitle,
+          text: trimmed,
+          projectId: devlogProjectId,
+          images,
+        }),
+      });
+      const data = await res.json().catch(() => null);
+      if (!res.ok) {
+        devlogError = data?.message || 'Failed to post devlog';
+      } else {
+        resetDevlogForm();
+        devlogFormOpen = false;
+        await fetchDevlogs();
+      }
+    } catch {
+      devlogError = 'Network error. Try again.';
+    }
+    devlogSubmitting = false;
+  }
+
+  async function deleteDevlog(id: string) {
+    if (!confirm('Delete this devlog?')) return;
+    try {
+      const res = await fetch(`/api/devlogs/${id}`, { method: 'DELETE' });
+      if (res.ok) devlogs = devlogs.filter((d) => d.id !== id);
+    } catch { /* silent */ }
+  }
+
+  function devlogProjectName(id: string | null): string | null {
+    if (!id) return null;
+    const p = projects.find((p) => p.id === id);
+    return p?.name ?? null;
   }
 
   async function markFulfillmentRead() {
@@ -857,13 +1367,10 @@
   }
 
   onMount(() => {
-    // Ensure custom cursor class matches saved preference on initial load
-    if (typeof document !== 'undefined') {
-      if (customCursorEnabled) {
-        document.documentElement.classList.add('custom-cursor');
-      } else {
-        document.documentElement.classList.remove('custom-cursor');
-      }
+    if (customCursorEnabled) {
+      document.documentElement.classList.add('custom-cursor');
+    } else {
+      document.documentElement.classList.remove('custom-cursor');
     }
 
     let loaded = 0;
@@ -882,37 +1389,35 @@
     fetchStickerLink();
     fetchPipes();
     fetchUnreadCount();
+    loadSectionData(activeSection);
+    updateEventCountdown();
+    const countdownTimer = window.setInterval(updateEventCountdown, 1000);
+
+    const handlePopstate = () => {
+      const section = sectionFromPath(window.location.pathname);
+      if (creatingProject || editingProject || reviewProject) resetForm();
+      activeSection = section;
+      loadSectionData(section);
+    };
+    window.addEventListener('popstate', handlePopstate);
+    return () => {
+      window.clearInterval(countdownTimer);
+      window.removeEventListener('popstate', handlePopstate);
+    };
   });
 </script>
 
-<div class="home" class:tile-loaded={tileLoaded} class:mobile-warning-active={!mobileWarningDismissed}>
-
-  <!-- Mobile warning -->
-  {#if !mobileWarningDismissed}
-  <div class="mobile-warning">
-    <div class="mobile-warning-inner">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="mobile-warning-icon">
-        <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
-        <line x1="12" y1="9" x2="12" y2="13"/>
-        <line x1="12" y1="17" x2="12.01" y2="17"/>
-      </svg>
-      <p class="mobile-warning-text">
-        <strong>#BEEST</strong> is built for desktop. For the best experience, please visit on a computer.
-      </p>
-      <button class="mobile-warning-dismiss" onclick={() => mobileWarningDismissed = true}>Continue anyway</button>
-    </div>
-  </div>
-  {/if}
+<div class="home" class:tile-loaded={tileLoaded}>
 
   <!-- Sidebar -->
   <nav class="sidebar pinned" aria-label="Home navigation">
     <div class="sidebar-panel">
       <div class="sidebar-content">
-        <a href="/" class="sidebar-brand">#BEEST</a>
+        <a href="/" class="sidebar-brand">BEEST</a>
         <p class="sidebar-greeting">Hey {data.user.nickname ?? data.user.name ?? 'there!'}</p>
         <ul class="sidebar-nav">
           {#each navItems as item}
-            <li>
+            <li class:mobile-only-hide={!item.mobile}>
               <button
                 class="nav-btn"
                 class:active={activeSection === item.id}
@@ -986,7 +1491,7 @@
                   {#if review.reviewerName}
                     <span class="review-feedback-reviewer">by {review.reviewerName}</span>
                   {/if}
-                  <span class="review-feedback-date">{new Date(review.createdAt).toLocaleDateString()}</span>
+                  <span class="review-feedback-date">{formatLocal(review.createdAt, { year: 'numeric', month: 'short', day: 'numeric' })}</span>
                 </div>
                 {#if review.feedback}
                   <p class="review-feedback-text">{review.feedback}</p>
@@ -1020,6 +1525,19 @@
               <input type="checkbox" bind:checked={resubmitMinHours} />
               <span>I have worked for at least 3 hours since the last ship</span>
             </label>
+
+            <label class="resubmit-label" for="resubmit-reviewer-note">Note to reviewer <span class="form-caption-inline">(optional)</span></label>
+            <textarea
+              id="resubmit-reviewer-note"
+              class="form-input form-textarea resubmit-textarea"
+              maxlength={1000}
+              placeholder="Anything you'd like the reviewer to know? (context, caveats, where to start, etc.)"
+              bind:value={resubmitReviewerNote}
+            ></textarea>
+            <div class="form-caption-row">
+              <span class="form-caption">Visible only to reviewers</span>
+              <span class="form-charcount" class:over={resubmitReviewerNote.length >= 1000}>{resubmitReviewerNote.length}/1000</span>
+            </div>
 
             {#if formError}
               <p class="form-error">{formError}</p>
@@ -1056,7 +1574,7 @@
                 {#if review.reviewerName}
                   <span class="review-feedback-reviewer">by {review.reviewerName}</span>
                 {/if}
-                <span class="review-feedback-date">{new Date(review.createdAt).toLocaleDateString()}</span>
+                <span class="review-feedback-date">{formatLocal(review.createdAt, { year: 'numeric', month: 'short', day: 'numeric' })}</span>
               </div>
               {#if review.feedback}
                 <p class="review-feedback-text">{review.feedback}</p>
@@ -1165,6 +1683,8 @@
               <option value="python">Python</option>
               <option value="android">Android Playable</option>
               <option value="ios">iOS Playable</option>
+              <option value="hardware">Hardware</option>
+              <option value="cad">CAD Models</option>
               <option value="other">Other / Not Sure</option>
             </select>
           </div>
@@ -1243,9 +1763,18 @@
         {#if editingProject?.status === 'unreviewed'}
           <div class="in-review-notice">
             <p class="in-review-text">This project is currently in review. You can still work on it and track hours, but you can't resubmit until it's been reviewed.</p>
+            {#if editingProjectQueue}
+              <p class="in-review-queue">
+                Queue position: <strong>{editingProjectQueue.position}</strong> of <strong>{editingProjectQueue.total}</strong>
+              </p>
+            {/if}
             <button class="form-btn-draft" onclick={() => convertToDraft(editingProject.id)}>
               Convert to Draft
             </button>
+          </div>
+        {:else if editingProject?.status === 'fraud_pending'}
+          <div class="in-review-notice">
+            <p class="in-review-text">This project has been reviewed and is awaiting fraud checks. You'll be notified once the fraud team finishes their review.</p>
           </div>
         {/if}
         <div class="form-actions">
@@ -1285,13 +1814,68 @@
     </div>
     {/if}
 
+    {#if activeSection === 'events'}
+    <section class="section section-events">
+      <div class="section-inner">
+        <h2 class="section-title">Upcoming Events</h2>
+        {#if eventItems.length === 0}
+          <p class="section-copy">No upcoming events are scheduled yet.</p>
+        {:else}
+          <div class="events-grid">
+            {#each eventItems as event}
+              <article class="event-card">
+                <div class="event-card-meta">
+                  <time datetime={event.startAt}>{formatLocal(event.startAt)}</time>
+                  {#if event.endAt}
+                    <span>— {formatLocal(event.endAt)}</span>
+                  {/if}
+                </div>
+                <h3>{event.title}</h3>
+                {#if event.hostedBy}
+                  <p class="event-hosted-by">
+                    Hosted by
+                    {#if event.hostedBySlackId}
+                      <a href={slackUserUrl(event.hostedBySlackId)} target="_blank" rel="noopener noreferrer">{event.hostedByName ?? event.hostedBySlackId}</a>
+                    {:else}
+                      {event.hostedByName ?? event.hostedBy}
+                    {/if}
+                  </p>
+                {/if}
+                {#if event.location}
+                  <p class="event-location">{event.location}</p>
+                {/if}
+                {#if event.description}
+                  <p>{event.description}</p>
+                {/if}
+                {#if event.url}
+                  <p><a href={event.url} target="_blank" rel="noopener noreferrer">Event details</a></p>
+                {/if}
+              </article>
+            {/each}
+          </div>
+        {/if}
+      </div>
+    </section>
+    {/if}
+
     {#if showShippingPrompt && shippingCheck}
     <section class="section section-review">
       <div class="section-inner">
         <button class="form-cancel review-close" onclick={() => { showShippingPrompt = false; }}>&times;</button>
         <h2 class="section-title">Complete Your Profile</h2>
-        <p class="shipping-prompt-text">Before submitting for review, we need your shipping details so we can send you prizes. Please fill out the missing info in your Hack Club Auth settings:</p>
+        <p class="shipping-prompt-text">Before submitting for review, we need a few things from your Hack Club Auth profile — we use these to verify you and to ship prizes when your project is approved:</p>
         <div class="shipping-prompt-items">
+          {#if !shippingCheck.identityVerified}
+            <div class="shipping-prompt-item missing">
+              <span class="shipping-icon">&#x2717;</span>
+              <span>Identity not verified</span>
+            </div>
+          {:else}
+            <div class="shipping-prompt-item done">
+              <span class="shipping-icon">&#x2713;</span>
+              <span>Identity verified</span>
+            </div>
+          {/if}
           {#if !shippingCheck.hasAddress}
             <div class="shipping-prompt-item missing">
               <span class="shipping-icon">&#x2717;</span>
@@ -1315,10 +1899,27 @@
             </div>
           {/if}
         </div>
-        <a class="action-btn shipping-portal-btn" href={shippingCheck.addressPortalUrl} target="_blank" rel="noopener noreferrer">
-          Update on Hack Club Auth
-        </a>
-        <p class="shipping-prompt-note">After updating your info, log out and log back in to refresh your profile, then try submitting again.</p>
+        {#if !shippingCheck.identityVerified}
+          <a class="action-btn shipping-portal-btn" href={shippingCheck.identityPortalUrl} target="_blank" rel="noopener noreferrer">
+            Verify your identity
+          </a>
+          {#if !identityPollExhausted}
+            <p class="shipping-prompt-poll">Checking automatically — verification can take a few seconds to reflect after Hack Club approves your document.</p>
+          {:else}
+            <button class="action-btn shipping-recheck-btn" onclick={manualIdentityRecheck}>
+              Check again
+            </button>
+            <p class="shipping-prompt-poll">We stopped checking automatically. Tap above once HQ approves your document.</p>
+          {/if}
+        {:else if shippingCheck.eligible}
+          <p class="shipping-prompt-poll shipping-prompt-success">Identity verified! Click Submit again to ship.</p>
+        {/if}
+        {#if !shippingCheck.hasAddress || !shippingCheck.hasBirthdate}
+          <a class="action-btn shipping-portal-btn" href={shippingCheck.addressPortalUrl} target="_blank" rel="noopener noreferrer">
+            Update address &amp; birthdate
+          </a>
+          <p class="shipping-prompt-note">Address and birthdate changes require a log out / log back in to refresh.</p>
+        {/if}
       </div>
     </section>
     {/if}
@@ -1347,9 +1948,25 @@
           </label>
           <label class="review-check">
             <input type="checkbox" bind:checked={checkStartedOrUpdated} />
-            <span>I started this project later than April 2nd, 2025, or shipped a significant update to an old project</span>
+            <span>I started this project later than August 2nd, 2026, or shipped a significant update to an old project</span>
           </label>
         </div>
+
+        <div class="reviewer-note-field">
+          <label class="resubmit-label" for="reviewer-note">Note to reviewer <span class="form-caption-inline">(optional)</span></label>
+          <textarea
+            id="reviewer-note"
+            class="form-input form-textarea resubmit-textarea"
+            maxlength={1000}
+            placeholder="Anything you'd like the reviewer to know? (context, caveats, where to start, etc.)"
+            bind:value={reviewerNote}
+          ></textarea>
+          <div class="form-caption-row">
+            <span class="form-caption">Visible only to reviewers</span>
+            <span class="form-charcount" class:over={reviewerNote.length >= 1000}>{reviewerNote.length}/1000</span>
+          </div>
+        </div>
+
         {#if formError}
           <p class="form-error">{formError}</p>
         {/if}
@@ -1379,6 +1996,19 @@
           <div>
             <h2 class="section-title">My Projects</h2>
             <p class="section-subtitle">Track your progress and hours.</p>
+          </div>
+          <div class="event-countdown" aria-label="Countdown to Beest">
+            <p class="event-countdown-kicker"><span class="event-countdown-logo">BEESTing</span> starts on</p>
+            {#if eventCountdown.live}
+              <p class="event-countdown-live">Live</p>
+            {:else}
+              <div class="event-countdown-grid">
+                <div class="event-countdown-unit"><strong>{eventCountdown.days}</strong><span>D</span></div>
+                <div class="event-countdown-unit"><strong>{eventCountdown.hours}</strong><span>H</span></div>
+                <div class="event-countdown-unit"><strong>{eventCountdown.minutes}</strong><span>M</span></div>
+                <div class="event-countdown-unit"><strong>{eventCountdown.seconds}</strong><span>S</span></div>
+              </div>
+            {/if}
           </div>
           <div class="progress-key">
             <span class="key-item"><span class="key-swatch approved"></span>Approved</span>
@@ -1431,7 +2061,7 @@
                   <div class="project-header-row">
                     <h3 class="project-name">{project.name}</h3>
                     <span class="project-type-badge">{project.projectType}</span>
-                    <span class="project-status-badge {project.status}">{project.status === 'changes_needed' ? 'Changes Needed' : project.status}</span>
+                    <span class="project-status-badge {project.status === 'fraud_pending' ? 'unreviewed' : project.status}">{project.status === 'changes_needed' ? 'Changes Needed' : project.status === 'fraud_pending' ? 'In Review' : project.status}</span>
                   </div>
                   <p class="project-desc">{project.description}</p>
                   <div class="project-links">
@@ -1454,7 +2084,10 @@
           {/if}
         </div>
         {#if projects.length > 0}
-          <button class="action-btn new-project-btn" onclick={openCreateProject}>+ New Project</button>
+          <div class="project-actions-row">
+            <button class="action-btn new-project-btn" onclick={openCreateProject}>+ New Project</button>
+            <a class="action-btn guide-btn" href="/guide">Shipping Guide</a>
+          </div>
         {/if}
 
         <div class="bottom-row">
@@ -1507,11 +2140,21 @@
                 <h2 class="section-title">Earn Prizes</h2>
                 <p class="section-subtitle">Build projects, earn hours, unlock rewards.<br><b>Hours spent in the shop detract from qualifying hours!</b></p>
               </div>
-              <div class="pipes-box">
-                <img src="/images/pipes.png" alt="Pipes" class="pipe-img" />
-                <div class="pipes-box-text">
-                  <span class="pipes-box-label">Pipes</span>
-                  <span class="pipes-box-value">{userPipes}</span>
+              <div class="shop-header-actions">
+                <button class="suggestions-btn" type="button" onclick={openSuggestions} aria-label="Shop suggestions">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="suggestions-icon" aria-hidden="true">
+                    <path d="M9 18h6" />
+                    <path d="M10 22h4" />
+                    <path d="M12 2a7 7 0 0 0-4 12.7c.6.5 1 1.3 1 2.1V18h6v-1.2c0-.8.4-1.6 1-2.1A7 7 0 0 0 12 2z" />
+                  </svg>
+                  <span>Suggestions</span>
+                </button>
+                <div class="pipes-box">
+                  <img src="/images/pipes.png" alt="Pipes" class="pipe-img" />
+                  <div class="pipes-box-text">
+                    <span class="pipes-box-label">Pipes</span>
+                    <span class="pipes-box-value">{userPipes}</span>
+                  </div>
                 </div>
               </div>
             </div>
@@ -1536,26 +2179,95 @@
           {:else if shopItems.length === 0}
             <p class="coming-soon">No items in the shop yet.</p>
           {:else}
-            <div class="shop-grid">
-              {#each shopItems as item}
-                <button class="shop-card" onclick={() => openShopItem(item)} type="button">
-                  <div class="shop-card-img">
-                    <img src={item.imageUrl} alt={item.name} loading="lazy" decoding="async" />
-                  </div>
-                  <div class="shop-card-body">
-                    <p class="shop-card-name">{item.name}</p>
-                    <p class="shop-card-desc">{item.description}</p>
-                    <div class="shop-card-footer">
-                      <p class="shop-card-cost">{item.priceHours} Pipes</p>
-                      {#if item.stock !== null}
-                        <span class="shop-card-stock" class:low={item.stock <= 3}>{item.stock} left</span>
+            {#if shopItems.some(i => i.isFeatured)}
+              <div class="shop-featured-section">
+                <h3 class="shop-section-title">Featured</h3>
+                <div class="shop-grid shop-grid-featured">
+                  {#each shopItems.filter(i => i.isFeatured) as item}
+                    <button class="shop-card shop-card-featured" onclick={() => openShopItem(item)} type="button">
+                      <div class="shop-card-img">
+                        <img src={item.imageUrl} alt={item.name} loading="lazy" decoding="async" />
+                      </div>
+                      <div class="shop-card-body">
+                        <p class="shop-card-name">{item.name}</p>
+                        <p class="shop-card-desc">{item.description}</p>
+                        <div class="shop-card-footer">
+                          <p class="shop-card-cost">{item.priceHours} Pipes</p>
+                          {#if item.stock !== null}
+                            <span class="shop-card-stock" class:low={item.stock <= 3}>{item.stock} left</span>
+                          {/if}
+                        </div>
+                      </div>
+                    </button>
+                  {/each}
+                </div>
+              </div>
+            {/if}
+            {#if shopItems.some(i => !i.isFeatured)}
+              {#if shopItems.some(i => i.isFeatured)}
+                <h3 class="shop-section-title">All Items</h3>
+              {/if}
+              <div class="shop-grid">
+                {#each shopItems.filter(i => !i.isFeatured) as item}
+                  <button class="shop-card" onclick={() => openShopItem(item)} type="button">
+                    <div class="shop-card-img">
+                      <img src={item.imageUrl} alt={item.name} loading="lazy" decoding="async" />
+                    </div>
+                    <div class="shop-card-body">
+                      <p class="shop-card-name">{item.name}</p>
+                      <p class="shop-card-desc">{item.description}</p>
+                      <div class="shop-card-footer">
+                        <p class="shop-card-cost">{item.priceHours} Pipes</p>
+                        {#if item.stock !== null}
+                          <span class="shop-card-stock" class:low={item.stock <= 3}>{item.stock} left</span>
+                        {/if}
+                      </div>
+                    </div>
+                  </button>
+                {/each}
+              </div>
+            {/if}
+          {/if}
+
+          <div class="my-orders">
+            <h3 class="my-orders-title">My Orders</h3>
+            {#if userOrdersLoading && userOrders.length === 0}
+              <p class="my-orders-empty">Loading…</p>
+            {:else if userOrders.length === 0}
+              <p class="my-orders-empty">You haven't placed any orders yet.</p>
+            {:else}
+              {#if refundError}
+                <p class="my-orders-error">{refundError}</p>
+              {/if}
+              <ul class="my-orders-list">
+                {#each userOrders as order}
+                  <li class="my-orders-row">
+                    <div class="my-orders-info">
+                      <span class="my-orders-name">{order.quantity}× {order.itemName}</span>
+                      <span class="my-orders-meta">
+                        {order.pipesSpent} Pipes · {new Date(order.createdAt).toLocaleDateString()}
+                      </span>
+                    </div>
+                    <div class="my-orders-actions">
+                      {#if order.status === 'pending'}
+                        <span class="my-orders-status pending">Pending</span>
+                        <button
+                          class="my-orders-refund"
+                          type="button"
+                          onclick={() => refundOrder(order)}
+                          disabled={refundingOrderId === order.id}
+                        >
+                          {refundingOrderId === order.id ? 'Refunding…' : 'Refund'}
+                        </button>
+                      {:else}
+                        <span class="my-orders-status fulfilled">Fulfilled</span>
                       {/if}
                     </div>
-                  </div>
-                </button>
-              {/each}
-            </div>
-          {/if}
+                  </li>
+                {/each}
+              </ul>
+            {/if}
+          </div>
         </div>
       </div>
     </section>
@@ -1597,21 +2309,19 @@
             <div class="shop-modal-qty">
               <span class="shop-modal-qty-label">Quantity</span>
               <div class="shop-modal-qty-controls">
-                <button
-                  class="qty-btn"
-                  type="button"
-                  onclick={() => { if (shopQuantity > 1) shopQuantity--; }}
-                  disabled={shopQuantity <= 1}
-                >-</button>
-                <span class="qty-value">{shopQuantity}</span>
-                <button
-                  class="qty-btn"
-                  type="button"
-                  onclick={() => {
-                    if (selectedShopItem!.stock === null || shopQuantity < selectedShopItem!.stock) shopQuantity++;
+                <input
+                  class="qty-input"
+                  type="text"
+                  inputmode="numeric"
+                  pattern="[0-9]*"
+                  value={shopQuantityText}
+                  oninput={(e) => {
+                    setShopQuantity(e.currentTarget.value);
+                    e.currentTarget.value = shopQuantityText;
                   }}
-                  disabled={selectedShopItem.stock !== null && shopQuantity >= selectedShopItem.stock}
-                >+</button>
+                  onblur={commitShopQuantity}
+                  aria-label="Quantity"
+                />
               </div>
             </div>
 
@@ -1640,6 +2350,108 @@
       </div>
     </div>
     {/if}
+
+    <!-- Shop suggestions modal -->
+    {#if suggestionsOpen}
+    <!-- svelte-ignore a11y_no_static_element_interactions a11y_click_events_have_key_events -->
+    <div use:portal class="suggestions-overlay" onclick={closeSuggestions} onkeydown={(e) => { if (e.key === 'Escape') closeSuggestions(); }}>
+      <!-- svelte-ignore a11y_no_static_element_interactions a11y_click_events_have_key_events -->
+      <div class="suggestions-modal" onclick={(e) => e.stopPropagation()}>
+        <button class="suggestions-close" onclick={closeSuggestions} type="button" aria-label="Close">&times;</button>
+        <h2 class="suggestions-title">Shop Suggestions</h2>
+        <p class="suggestions-subtitle">What should we add to the shop? Upvote ideas you like.</p>
+
+        <div class="suggestions-new">
+          <textarea
+            class="suggestions-input"
+            placeholder="Suggest a new shop item..."
+            maxlength="200"
+            bind:value={newSuggestionText}
+            disabled={suggestionSubmitting}
+          ></textarea>
+          <div class="suggestions-new-footer">
+            <span class="suggestions-counter">{newSuggestionText.length}/200</span>
+            <button
+              class="suggestions-submit"
+              type="button"
+              onclick={submitSuggestion}
+              disabled={!newSuggestionText.trim() || suggestionSubmitting}
+            >{suggestionSubmitting ? 'Submitting...' : 'Suggest'}</button>
+          </div>
+          {#if suggestionError}
+            <p class="suggestions-error">{suggestionError}</p>
+          {/if}
+        </div>
+
+        <div class="suggestions-list">
+          {#if suggestionsLoading}
+            <p class="suggestions-empty">Loading...</p>
+          {:else if suggestions.length === 0}
+            <p class="suggestions-empty">No suggestions yet — be the first!</p>
+          {:else}
+            {#each suggestions as s (s.id)}
+              <div class="suggestion-row">
+                <button
+                  class="suggestion-vote"
+                  class:voted={s.votedByUser}
+                  type="button"
+                  onclick={() => toggleSuggestionVote(s)}
+                  aria-label={s.votedByUser ? 'Remove upvote' : 'Upvote'}
+                >
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <polyline points="6 14 12 8 18 14" />
+                  </svg>
+                  <span class="suggestion-vote-count">{s.voteCount}</span>
+                </button>
+                <div class="suggestion-body">
+                  <p class="suggestion-text">{s.text}</p>
+                  <p class="suggestion-meta">
+                    <span>by {s.authorName}</span>
+                    {#if s.isMine}
+                      <button class="suggestion-delete" type="button" onclick={() => deleteSuggestion(s.id)}>Delete</button>
+                    {/if}
+                  </p>
+                </div>
+              </div>
+            {/each}
+          {/if}
+        </div>
+      </div>
+    </div>
+    {/if}
+    {/if}
+
+    <!-- One-time "hackathon or shop?" prompt. No dismiss — stays until answered.
+         Rendered outside any activeSection block so it shows on every /home visit,
+         not just the shop tab. -->
+    {#if showIntent}
+    <!-- svelte-ignore a11y_no_static_element_interactions -->
+    <div use:portal class="intent-overlay" class:intent-hide={intentFadingOut} role="dialog" aria-modal="true" aria-label="Why are you here?">
+      <div class="intent-modal">
+        {#if intentThanked}
+          <h2 class="intent-title">Thank you!</h2>
+          <p class="intent-sub">Your answer's been saved.</p>
+        {:else}
+          <h2 class="intent-title">What brings you here?</h2>
+          <p class="intent-sub">Let me know your intention so I can work out the event budget</p>
+          <div class="intent-options">
+            <button class="intent-btn" onclick={() => chooseIntent('Hackathon')} disabled={intentSaving}>
+              <span>The hackathon</span>
+            </button>
+            <button class="intent-btn" onclick={() => chooseIntent('Shop')} disabled={intentSaving}>
+              <span>The shop</span>
+            </button>
+            <button class="intent-btn" onclick={() => chooseIntent('Browsing')} disabled={intentSaving}>
+              <span>Just browsing</span>
+            </button>
+            <button class="intent-btn" onclick={() => chooseIntent('Both')} disabled={intentSaving}>
+              <span>Both / unsure</span>
+            </button>
+          </div>
+          {#if intentError}<p class="intent-error">{intentError}</p>{/if}
+        {/if}
+      </div>
+    </div>
     {/if}
 
     {#if activeSection === 'explore'}
@@ -1710,119 +2522,6 @@
     </section>
     {/if}
 
-    <!-- Project detail overlay -->
-    {#if detailProject}
-    <div class="detail-overlay" role="dialog" aria-modal="true">
-      <div class="detail-backdrop" onclick={closeProjectDetail} onkeydown={(e) => e.key === 'Escape' && closeProjectDetail()} role="button" tabindex="-1"></div>
-      <div class="detail-panel">
-        <button class="detail-close" onclick={closeProjectDetail} type="button" aria-label="Close">&times;</button>
-
-        <!-- Image gallery -->
-        <div class="detail-gallery">
-          {#if detailProject.screenshot1Url || detailProject.screenshot2Url}
-            {@const screenshots = [detailProject.screenshot1Url, detailProject.screenshot2Url].filter(Boolean) as string[]}
-            <div class="detail-img-wrap">
-              <img
-                class="detail-img"
-                src={screenshots[detailActiveImg] ?? screenshots[0]}
-                alt="{detailProject.name} screenshot {detailActiveImg + 1}"
-              />
-              {#if screenshots.length > 1}
-                <button class="detail-arrow detail-arrow-left" onclick={() => detailActiveImg = detailActiveImg === 0 ? screenshots.length - 1 : detailActiveImg - 1} type="button" aria-label="Previous screenshot">&#8249;</button>
-                <button class="detail-arrow detail-arrow-right" onclick={() => detailActiveImg = (detailActiveImg + 1) % screenshots.length} type="button" aria-label="Next screenshot">&#8250;</button>
-                <div class="detail-img-dots">
-                  {#each screenshots as _, i}
-                    <span class="detail-dot" class:detail-dot-active={detailActiveImg === i}></span>
-                  {/each}
-                </div>
-              {/if}
-            </div>
-          {:else}
-            <div class="detail-img-wrap detail-no-img">
-              <span>No screenshots</span>
-            </div>
-          {/if}
-        </div>
-
-        <!-- Project info -->
-        <div class="detail-info">
-          <div class="detail-header">
-            <h2 class="detail-name">{detailProject.name}</h2>
-            <span class="detail-type">{detailProject.projectType}</span>
-          </div>
-          <p class="detail-builder">by {detailProject.builderName}</p>
-          {#if detailProject.hours > 0}
-            <p class="detail-hours">{detailProject.hours.toFixed(1)} hours</p>
-          {/if}
-          <p class="detail-desc">{detailProject.description}</p>
-
-          <!-- Chunky action buttons -->
-          <div class="detail-actions">
-            {#if detailProject.demoUrl}
-              <a href={detailProject.demoUrl} target="_blank" rel="noopener noreferrer" class="detail-btn detail-btn-demo">
-                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polygon points="10 8 16 12 10 16 10 8"/></svg>
-                View Demo
-              </a>
-            {/if}
-            {#if detailProject.codeUrl}
-              <a href={detailProject.codeUrl} target="_blank" rel="noopener noreferrer" class="detail-btn detail-btn-code">
-                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
-                Source Code
-              </a>
-            {/if}
-          </div>
-        </div>
-
-        <!-- Comments -->
-        <div class="detail-comments">
-          <h3 class="detail-comments-title">Comments</h3>
-
-          <div class="detail-comment-form">
-            <textarea
-              class="detail-comment-input"
-              bind:value={detailCommentText}
-              placeholder="Leave a comment..."
-              maxlength="500"
-              rows="3"
-            ></textarea>
-            <div class="detail-comment-form-footer">
-              <span class="detail-comment-charcount">{detailCommentText.length}/500</span>
-              <button
-                class="detail-comment-submit"
-                onclick={submitComment}
-                disabled={detailCommentSubmitting || detailCommentText.trim().length === 0}
-                type="button"
-              >
-                {detailCommentSubmitting ? 'Posting...' : 'Post'}
-              </button>
-            </div>
-          </div>
-
-          {#if detailCommentsLoading}
-            <p class="detail-comments-loading">Loading comments...</p>
-          {:else if detailComments.length === 0}
-            <p class="detail-comments-empty">No comments yet. Be the first!</p>
-          {:else}
-            <div class="detail-comments-list">
-              {#each detailComments as comment}
-                <div class="detail-comment">
-                  <div class="detail-comment-header">
-                    <span class="detail-comment-author">{comment.authorName}</span>
-                    <span class="detail-comment-date">{new Date(comment.createdAt).toLocaleDateString()}</span>
-                    {#if comment.authorId === data.user.uid || detailProject.ownerId === data.user.uid || data.role}
-                      <button class="detail-comment-delete" onclick={() => deleteComment(comment.id)} type="button" title="Delete comment">&times;</button>
-                    {/if}
-                  </div>
-                  <p class="detail-comment-body">{comment.body}</p>
-                </div>
-              {/each}
-            </div>
-          {/if}
-        </div>
-      </div>
-    </div>
-    {/if}
-
     {#if activeSection === 'leaderboard'}
     <section class="section section-leaderboard">
       <div class="section-inner">
@@ -1855,9 +2554,22 @@
               <div class="leaderboard-row" class:top-three={i < 3}>
                 <span class="lb-rank">{i + 1}</span>
                 <span class="lb-name">{entry.name}</span>
-                <span class="lb-hours">{entry.hours}h</span>
+                <span class="lb-hours">{Math.round(entry.hours * 10) / 10}h</span>
               </div>
             {/each}
+            {#if leaderboard.length < leaderboardTotal}
+              <button
+                type="button"
+                class="lb-show-more"
+                onclick={loadMoreLeaderboard}
+                disabled={leaderboardLoadingMore}>
+                {#if leaderboardLoadingMore}
+                  Loading…
+                {:else}
+                  Show more ({Math.min(LEADERBOARD_PAGE_SIZE, leaderboardTotal - leaderboard.length)} more)
+                {/if}
+              </button>
+            {/if}
           {/if}
         </div>
       </div>
@@ -1884,7 +2596,7 @@
         </svg>
 
         <h2 class="faq-title">Frequently Asked Questions</h2>
-        <p class="faq-intro">I'm sure you have lots of questions! Below is the most common ones I see, but if you need more help please email euan@hackclub.com or use the dedicated slack channel #beest-help</p>
+        <p class="faq-intro">I'm sure you have lots of questions! Below is the most common ones I see, but if you need more help please email beest@hackclub.com or use the dedicated slack channel #beest-help</p>
 
         <div class="faq-list">
           {#each faqItems as faq, i (faq.q)}
@@ -1905,6 +2617,125 @@
               {/if}
             </button>
           {/each}
+        </div>
+      </div>
+    </section>
+    {/if}
+
+    {#if activeSection === 'devlogs'}
+    <section class="section section-devlogs">
+      <div class="section-inner">
+        <h2 class="section-title">Devlogs</h2>
+        <p class="devlogs-blurb">Devlogs are <strong>mandatory for hardware projects</strong> and optional for software.</p>
+
+        {#if !devlogFormVisible}
+          <button class="devlog-new-btn" onclick={() => { devlogFormOpen = true; }}>+ New devlog</button>
+        {/if}
+
+        {#if devlogFormVisible}
+        <div class="devlog-create">
+          <div class="devlog-form">
+            <div class="devlog-field">
+              <label class="form-label" for="devlog-project">Project <span class="required">*</span></label>
+              <select id="devlog-project" class="form-input form-select devlog-select" bind:value={devlogProjectId}>
+                <option value="" disabled>{projects.length === 0 ? 'Create a project first' : 'Select a project to link this devlog to'}</option>
+                {#each projects as p}
+                  <option value={p.id}>{p.name}</option>
+                {/each}
+              </select>
+            </div>
+
+            <div class="devlog-field">
+              <label class="form-label" for="devlog-title">Title <span class="required">*</span></label>
+              <input
+                id="devlog-title"
+                type="text"
+                class="form-input devlog-input"
+                maxlength={DEVLOG_TITLE_MAX}
+                bind:value={devlogTitle}
+              />
+              <div class="form-caption-row">
+                <span class="form-charcount" class:over={devlogTitle.length >= DEVLOG_TITLE_MAX}>{devlogTitle.length}/{DEVLOG_TITLE_MAX}</span>
+              </div>
+            </div>
+
+            <div class="devlog-field">
+              <label class="form-label" for="devlog-text">What did you work on?</label>
+              <textarea
+                id="devlog-text"
+                class="form-input form-textarea devlog-textarea"
+                maxlength={DEVLOG_TEXT_MAX}
+                bind:value={devlogText}
+              ></textarea>
+              <div class="form-caption-row">
+                <span class="form-charcount" class:over={devlogText.length >= DEVLOG_TEXT_MAX}>{devlogText.length}/{DEVLOG_TEXT_MAX}</span>
+              </div>
+            </div>
+
+            {#if devlogError}
+              <p class="form-error">{devlogError}</p>
+            {/if}
+
+            <button class="btn-primary devlog-submit" onclick={submitDevlog} disabled={devlogSubmitting || !devlogTitle.trim() || !devlogText.trim() || !devlogProjectId}>
+              {devlogSubmitting ? 'Posting…' : 'Post devlog'}
+            </button>
+          </div>
+
+          <aside class="devlog-images-card" aria-label="Devlog images">
+            <span class="form-label devlog-images-label">Images</span>
+            <div class="devlog-images-grid">
+              {#each Array(DEVLOG_MAX_IMAGES) as _, i (i)}
+                {#if devlogPreviews[i]}
+                  <div class="devlog-image-thumb">
+                    <img src={devlogPreviews[i]} alt="Attachment {i + 1}" />
+                    <button type="button" class="devlog-image-remove" onclick={() => removeDevlogImage(i)} aria-label="Remove image">&times;</button>
+                  </div>
+                {:else if i === devlogPreviews.findIndex((p) => p === '')}
+                  <label class="devlog-image-add" for="devlog-image" title="Add image">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                      <line x1="12" y1="5" x2="12" y2="19" />
+                      <line x1="5" y1="12" x2="19" y2="12" />
+                    </svg>
+                  </label>
+                {:else}
+                  <div class="devlog-image-empty" aria-hidden="true"></div>
+                {/if}
+              {/each}
+            </div>
+            <input id="devlog-image" type="file" accept="image/*" class="form-file-hidden" onchange={handleDevlogImage} />
+            <p class="devlog-images-hint">Up to {DEVLOG_MAX_IMAGES} images, 8 MB each.</p>
+          </aside>
+        </div>
+        {#if devlogs.length > 0}
+          <button type="button" class="devlog-cancel-btn" onclick={() => { devlogFormOpen = false; resetDevlogForm(); }}>Cancel</button>
+        {/if}
+        {/if}
+
+        <div class="devlogs-list">
+          {#if devlogsLoading && devlogs.length === 0}
+            <p class="devlog-empty">Loading…</p>
+          {:else if devlogs.length > 0}
+            {#each devlogs as dl (dl.id)}
+              <article class="devlog-card">
+                <header class="devlog-card-header">
+                  <span class="devlog-card-project">{devlogProjectName(dl.projectId) ?? 'Project removed'}</span>
+                  <span class="devlog-card-time">{formatLocal(dl.createdAt)}</span>
+                  <button class="devlog-card-delete" onclick={() => deleteDevlog(dl.id)} title="Delete devlog">×</button>
+                </header>
+                <h3 class="devlog-card-title">{dl.title}</h3>
+                <p class="devlog-card-text">{dl.text}</p>
+                {#if dl.imageUrls && dl.imageUrls.length > 0}
+                  <div class="devlog-card-images">
+                    {#each dl.imageUrls as url}
+                      <button type="button" class="devlog-card-image-btn" onclick={() => openDevlogLightbox(url)}>
+                        <img src={url} alt="Devlog attachment" loading="lazy" />
+                      </button>
+                    {/each}
+                  </div>
+                {/if}
+              </article>
+            {/each}
+          {/if}
         </div>
       </div>
     </section>
@@ -1997,7 +2828,13 @@
                 </div>
                 <div class="account-field">
                   <span class="account-label">Slack ID</span>
-                  <span class="account-value">{data.user.slack_id ?? '—'}</span>
+                  <span class="account-value">
+                    {#if data.user.slack_id}
+                      <a href={slackUserUrl(data.user.slack_id)} target="_blank" rel="noopener noreferrer" class="account-link">{data.user.slack_id}</a>
+                    {:else}
+                      —
+                    {/if}
+                  </span>
                 </div>
                 <div class="account-field">
                   <span class="account-label">Gender</span>
@@ -2042,7 +2879,131 @@
     {/if}
 
   </main>
+
+  <!-- Project detail overlay (rendered outside <main> so position:fixed is relative to viewport, not the filtered main element) -->
+  {#if detailProject}
+  <div class="detail-overlay" role="dialog" aria-modal="true">
+    <div class="detail-backdrop" onclick={closeProjectDetail} onkeydown={(e) => e.key === 'Escape' && closeProjectDetail()} role="button" tabindex="-1"></div>
+    <div class="detail-panel">
+      <button class="detail-close" onclick={closeProjectDetail} type="button" aria-label="Close">&times;</button>
+
+      <!-- Image gallery -->
+      <div class="detail-gallery">
+        {#if detailProject.screenshot1Url || detailProject.screenshot2Url}
+          {@const screenshots = [detailProject.screenshot1Url, detailProject.screenshot2Url].filter(Boolean) as string[]}
+          <div class="detail-img-wrap">
+            <img
+              class="detail-img"
+              src={screenshots[detailActiveImg] ?? screenshots[0]}
+              alt="{detailProject.name} screenshot {detailActiveImg + 1}"
+            />
+            {#if screenshots.length > 1}
+              <button class="detail-arrow detail-arrow-left" onclick={() => detailActiveImg = detailActiveImg === 0 ? screenshots.length - 1 : detailActiveImg - 1} type="button" aria-label="Previous screenshot">&#8249;</button>
+              <button class="detail-arrow detail-arrow-right" onclick={() => detailActiveImg = (detailActiveImg + 1) % screenshots.length} type="button" aria-label="Next screenshot">&#8250;</button>
+              <div class="detail-img-dots">
+                {#each screenshots as _, i}
+                  <span class="detail-dot" class:detail-dot-active={detailActiveImg === i}></span>
+                {/each}
+              </div>
+            {/if}
+          </div>
+        {:else}
+          <div class="detail-img-wrap detail-no-img">
+            <span>No screenshots</span>
+          </div>
+        {/if}
+      </div>
+
+      <!-- Project info -->
+      <div class="detail-info">
+        <div class="detail-header">
+          <h2 class="detail-name">{detailProject.name}</h2>
+          <span class="detail-type">{detailProject.projectType}</span>
+        </div>
+        <p class="detail-builder">by {detailProject.builderName}</p>
+        {#if detailProject.hours > 0}
+          <p class="detail-hours">{detailProject.hours.toFixed(1)} hours</p>
+        {/if}
+        <p class="detail-desc">{detailProject.description}</p>
+
+        <!-- Chunky action buttons -->
+        <div class="detail-actions">
+          {#if detailProject.demoUrl}
+            <a href={detailProject.demoUrl} target="_blank" rel="noopener noreferrer" class="detail-btn detail-btn-demo">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polygon points="10 8 16 12 10 16 10 8"/></svg>
+              View Demo
+            </a>
+          {/if}
+          {#if detailProject.codeUrl}
+            <a href={detailProject.codeUrl} target="_blank" rel="noopener noreferrer" class="detail-btn detail-btn-code">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
+              Source Code
+            </a>
+          {/if}
+        </div>
+      </div>
+
+      <!-- Comments -->
+      <div class="detail-comments">
+        <h3 class="detail-comments-title">Comments</h3>
+
+        <div class="detail-comment-form">
+          <textarea
+            class="detail-comment-input"
+            bind:value={detailCommentText}
+            placeholder="Leave a comment..."
+            maxlength="500"
+            rows="3"
+          ></textarea>
+          <div class="detail-comment-form-footer">
+            <span class="detail-comment-charcount">{detailCommentText.length}/500</span>
+            <button
+              class="detail-comment-submit"
+              onclick={submitComment}
+              disabled={detailCommentSubmitting || detailCommentText.trim().length === 0}
+              type="button"
+            >
+              {detailCommentSubmitting ? 'Posting...' : 'Post'}
+            </button>
+          </div>
+        </div>
+
+        {#if detailCommentsLoading}
+          <p class="detail-comments-loading">Loading comments...</p>
+        {:else if detailComments.length === 0}
+          <p class="detail-comments-empty">No comments yet. Be the first!</p>
+        {:else}
+          <div class="detail-comments-list">
+            {#each detailComments as comment}
+              <div class="detail-comment">
+                <div class="detail-comment-header">
+                  <span class="detail-comment-author">{comment.authorName}</span>
+                  <span class="detail-comment-date">{new Date(comment.createdAt).toLocaleDateString()}</span>
+                  {#if comment.authorId === data.user.uid || detailProject.ownerId === data.user.uid || data.role}
+                    <button class="detail-comment-delete" onclick={() => deleteComment(comment.id)} type="button" title="Delete comment">&times;</button>
+                  {/if}
+                </div>
+                <p class="detail-comment-body">{comment.body}</p>
+              </div>
+            {/each}
+          </div>
+        {/if}
+      </div>
+    </div>
+  </div>
+  {/if}
 </div>
+
+<svelte:window onkeydown={onDevlogLightboxKey} />
+
+{#if devlogLightbox}
+  <!-- svelte-ignore a11y_click_events_have_key_events -->
+  <!-- svelte-ignore a11y_no_static_element_interactions -->
+  <div class="devlog-lightbox" onclick={closeDevlogLightbox} role="dialog" aria-modal="true" aria-label="Devlog image">
+    <img src={devlogLightbox} alt="Devlog attachment full size" onclick={(e) => e.stopPropagation()} />
+    <button type="button" class="devlog-lightbox-close" onclick={closeDevlogLightbox} aria-label="Close">&times;</button>
+  </div>
+{/if}
 
 <style>
   @font-face {
@@ -2070,6 +3031,7 @@
     margin: 0;
     padding: 0;
     background: #4b4840;
+    overflow-x: hidden;
   }
 
   /* ── layout ──────────────────────────────────────── */
@@ -2235,7 +3197,7 @@
     padding: 0;
     display: flex;
     flex-direction: column;
-    gap: 6px;
+    gap: 3px;
   }
 
   .nav-btn {
@@ -2243,15 +3205,15 @@
     align-items: center;
     gap: 12px;
     width: 100%;
-    padding: 8px 14px;
+    padding: 5px 12px;
     border: 3px solid transparent;
     border-bottom: 6px solid transparent;
     border-radius: 6px;
     background: transparent;
     color: #cbc1ae;
     font-family: "Stone Breaker", "Courier New", monospace;
-    font-size: 19px;
-    letter-spacing: 0.04em;
+    font-size: 17px;
+    letter-spacing: 0.03em;
     text-align: left;
     cursor: inherit;
     transition: background 150ms ease, color 150ms ease, transform 0.1s ease, border-bottom-width 0.1s ease, border-color 150ms ease;
@@ -2358,6 +3320,11 @@
     background-image: url('/images/tile3.webp');
   }
 
+  .tile-loaded .section-devlogs::after {
+    background-image: url('/images/tile2.webp');
+    opacity: 0.18;
+  }
+
   .section-inner {
     position: relative;
     z-index: 1;
@@ -2383,6 +3350,98 @@
     font-size: clamp(14px, 1.2vw, 17px);
     color: #cbc1ae;
     letter-spacing: 0.02em;
+  }
+
+  .section-events {
+    margin-bottom: 48px;
+  }
+
+  .events-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 20px;
+  }
+
+  .event-card {
+    padding: 24px;
+    border-radius: 24px;
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    box-shadow: 0 18px 45px rgba(0, 0, 0, 0.1);
+  }
+
+  .event-card h3 {
+    margin: 0 0 10px;
+    font-family: "Stone Breaker", "Courier New", monospace;
+    font-size: 1.25rem;
+    letter-spacing: 0.04em;
+    color: #e6f4fe;
+  }
+
+  .event-card p {
+    margin: 0 0 12px;
+    font-family: "Courier New", monospace;
+    font-size: 15px;
+    line-height: 1.45;
+    color: #cbc1ae;
+  }
+
+  .event-hosted-by {
+    display: inline-flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px;
+    width: fit-content;
+    padding: 4px 9px;
+    border: 1px solid rgba(203, 193, 174, 0.18);
+    border-radius: 4px;
+    background: rgba(203, 193, 174, 0.12);
+    color: #e6f4fe;
+    font-weight: 700;
+    box-shadow: 3px 3px 0 rgba(0, 0, 0, 0.14);
+  }
+
+  .event-hosted-by a {
+    color: #93b4cd;
+    text-decoration: underline;
+  }
+
+  .event-card-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+    margin-bottom: 16px;
+    font-family: "Sunny Mood", "Courier New", monospace;
+    color: #e6f4fe;
+    font-size: 20px;
+    line-height: 1.1;
+    text-shadow: 2px 2px 0 rgba(0, 0, 0, 0.3);
+  }
+
+  .event-card-meta time,
+  .event-card-meta span {
+    display: inline-flex;
+    align-items: center;
+    min-height: 32px;
+    padding: 4px 10px;
+    border: 1px solid rgba(230, 244, 254, 0.18);
+    border-radius: 4px;
+    background: rgba(147, 180, 205, 0.16);
+    box-shadow: 3px 3px 0 rgba(0, 0, 0, 0.18);
+  }
+
+  .event-location {
+    margin: 0 0 12px;
+    font-family: "Courier New", monospace;
+    color: #e6f4fe;
+    font-weight: 600;
+  }
+
+  .event-card a {
+    font-family: "Courier New", monospace;
+    color: #93b4cd;
+    text-decoration: underline;
   }
 
   /* ── bottom row ───────────────────────────────────── */
@@ -2554,7 +3613,7 @@
     flex-direction: column;
     width: 100%;
     position: relative;
-    overflow-x: clip;
+    overflow-x: hidden;
   }
 
   .create-project-form::after {
@@ -3011,6 +4070,15 @@
     text-shadow: 2px 2px 0 rgba(0, 0, 0, 0.3);
   }
 
+  .in-review-queue {
+    margin: 8px 0 0;
+    font-family: "Courier New", monospace;
+    font-size: 13px;
+    color: #cbc1ae;
+    line-height: 1.4;
+    text-shadow: 2px 2px 0 rgba(0, 0, 0, 0.3);
+  }
+
   .form-btn-draft {
     margin-top: 12px;
     padding: 8px 20px;
@@ -3258,6 +4326,17 @@
     padding: 14px 36px;
   }
 
+  .reviewer-note-field {
+    margin-top: 24px;
+    text-align: left;
+  }
+
+  .form-caption-inline {
+    font-size: 0.85em;
+    opacity: 0.7;
+    font-weight: normal;
+  }
+
   .review-tooltip {
     display: none;
     position: absolute;
@@ -3445,6 +4524,408 @@
     box-sizing: border-box;
   }
 
+  /* ── Devlogs section ───────────────────────── */
+  .section-devlogs {
+    background: #52504a;
+    padding-top: 48px;
+  }
+
+  .devlogs-blurb {
+    color: #cbc1ae;
+    font-family: "Courier New", monospace;
+    font-size: 14px;
+    margin: 0 0 18px;
+    max-width: 700px;
+    opacity: 0.85;
+  }
+
+  .devlog-new-btn {
+    display: inline-block;
+    width: 100%;
+    max-width: 720px;
+    box-sizing: border-box;
+    margin-bottom: 18px;
+    padding: 10px 22px;
+    background: #9a9285;
+    color: #2e2a26;
+    font-family: "Stone Breaker", "Courier New", monospace;
+    font-size: 16px;
+    border: 2px solid #2e2a26;
+    border-radius: 6px;
+    cursor: pointer;
+    box-shadow: 0 3px 0 #2e2a26;
+    transition: transform 0.1s ease, box-shadow 0.1s ease, background 0.15s;
+  }
+
+  .devlog-new-btn:hover {
+    background: #aea597;
+  }
+
+  .devlog-new-btn:active {
+    transform: translateY(2px);
+    box-shadow: 0 1px 0 #2e2a26;
+  }
+
+  .devlog-cancel-btn {
+    display: inline-block;
+    margin: 8px 0 18px;
+    padding: 6px 14px;
+    background: transparent;
+    color: #cbc1ae;
+    font-family: "Courier New", monospace;
+    font-size: 13px;
+    border: 1px solid rgba(203, 193, 174, 0.35);
+    border-radius: 4px;
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s;
+  }
+
+  .devlog-cancel-btn:hover {
+    background: rgba(203, 193, 174, 0.1);
+    border-color: #cbc1ae;
+  }
+
+  /* Two-pane create row: form card on the left, separate images card on the right */
+  .devlog-create {
+    display: flex;
+    align-items: flex-start;
+    gap: 14px;
+    margin-bottom: 22px;
+    max-width: 720px;
+  }
+
+  .devlog-form,
+  .devlog-images-card {
+    background: #3a3530;
+    border: 2px solid #2e2a26;
+    border-radius: 8px;
+    padding: 14px;
+    box-shadow:
+      0 4px 8px rgba(0, 0, 0, 0.3),
+      0 8px 20px rgba(0, 0, 0, 0.25);
+  }
+
+  .devlog-form {
+    flex: 1 1 auto;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .devlog-images-card {
+    flex: 0 0 auto;
+    width: 188px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .devlog-field {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .devlog-input,
+  .devlog-textarea,
+  .devlog-select {
+    width: 100%;
+    box-sizing: border-box;
+  }
+
+  .devlog-textarea {
+    min-height: 130px;
+    resize: vertical;
+    line-height: 1.45;
+  }
+
+  .devlog-images-label {
+    margin: 0;
+  }
+
+  .devlog-images-hint {
+    margin: 2px 0 0;
+    font-family: "Courier New", monospace;
+    font-size: 11px;
+    color: #7f796d;
+    line-height: 1.4;
+  }
+
+  .devlog-images-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 70px);
+    grid-template-rows: repeat(2, 70px);
+    gap: 6px;
+  }
+
+  @media (max-width: 720px) {
+    .devlog-create {
+      flex-direction: column;
+    }
+    .devlog-images-card {
+      width: 100%;
+    }
+    .devlog-images-grid {
+      grid-template-columns: repeat(4, 70px);
+      grid-template-rows: 70px;
+    }
+  }
+
+  .devlog-image-empty {
+    width: 70px;
+    height: 70px;
+    border-radius: 6px;
+    border: 1px dashed rgba(203, 193, 174, 0.18);
+    background: rgba(0, 0, 0, 0.15);
+  }
+
+  .devlog-image-add {
+    width: 70px;
+    height: 70px;
+    border-radius: 6px;
+    border: 1px dashed rgba(154, 146, 133, 0.55);
+    background: rgba(154, 146, 133, 0.1);
+    color: #c4bcae;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s;
+  }
+
+  .devlog-image-add:hover {
+    background: rgba(154, 146, 133, 0.22);
+    border-color: #9a9285;
+  }
+
+  .devlog-image-add svg {
+    width: 22px;
+    height: 22px;
+  }
+
+  .devlog-image-thumb {
+    position: relative;
+    width: 70px;
+    height: 70px;
+    border-radius: 6px;
+    overflow: hidden;
+    border: 1px solid #2e2a26;
+    background: #2a2620;
+  }
+
+  .devlog-image-thumb img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+  }
+
+  .devlog-image-remove {
+    position: absolute;
+    top: 2px;
+    right: 2px;
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
+    border: 0;
+    background: rgba(0, 0, 0, 0.6);
+    color: #fff;
+    font-size: 14px;
+    line-height: 22px;
+    text-align: center;
+    cursor: pointer;
+    padding: 0;
+  }
+
+  .devlog-submit {
+    display: inline-block;
+    margin-top: 14px;
+    padding: 10px 22px;
+    background: #9a9285;
+    color: #2e2a26;
+    font-family: "Stone Breaker", "Courier New", monospace;
+    font-size: 17px;
+    border: 2px solid #2e2a26;
+    border-radius: 6px;
+    cursor: pointer;
+    box-shadow: 0 3px 0 #2e2a26;
+    transition: transform 0.1s ease, box-shadow 0.1s ease, opacity 0.15s;
+  }
+
+  .devlog-submit:hover:not(:disabled) {
+    background: #aea597;
+  }
+
+  .devlog-submit:active:not(:disabled) {
+    transform: translateY(2px);
+    box-shadow: 0 1px 0 #2e2a26;
+  }
+
+  .devlog-submit:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+  }
+
+  .devlogs-list {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    max-width: 720px;
+  }
+
+  .devlog-empty {
+    color: #cbc1ae;
+    opacity: 0.7;
+    font-family: "Courier New", monospace;
+    font-size: 14px;
+  }
+
+  .devlog-card {
+    background: #3a3530;
+    border: 2px solid #2e2a26;
+    border-left: 4px solid #9a9285;
+    border-radius: 8px;
+    padding: 14px 16px;
+    box-shadow:
+      0 3px 6px rgba(0, 0, 0, 0.25),
+      0 6px 14px rgba(0, 0, 0, 0.18);
+  }
+
+  .devlog-card-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 8px;
+    font-family: "Courier New", monospace;
+    font-size: 12px;
+    color: #cbc1ae;
+  }
+
+  .devlog-card-project {
+    background: rgba(154, 146, 133, 0.22);
+    color: #d6cfc1;
+    border: 1px solid #9a9285;
+    border-radius: 999px;
+    padding: 2px 10px;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.02em;
+  }
+
+  .devlog-card-time {
+    color: #7f796d;
+    margin-left: auto;
+  }
+
+  .devlog-card-delete {
+    background: transparent;
+    border: 0;
+    color: #7f796d;
+    font-size: 18px;
+    line-height: 1;
+    cursor: pointer;
+    padding: 0 4px;
+    transition: color 0.15s;
+  }
+
+  .devlog-card-delete:hover {
+    color: #c48382;
+  }
+
+  .devlog-card-title {
+    margin: 0 0 6px;
+    font-family: "Stone Breaker", "Courier New", monospace;
+    font-size: 18px;
+    color: #e6f4fe;
+    letter-spacing: 0.02em;
+    line-height: 1.25;
+    text-shadow: 1px 1px 0 rgba(0, 0, 0, 0.3);
+  }
+
+  .devlog-card-text {
+    margin: 0;
+    color: #e6e2da;
+    font-family: "Courier New", monospace;
+    font-size: 14px;
+    line-height: 1.55;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  .devlog-card-images {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 12px;
+  }
+
+  .devlog-card-image-btn {
+    padding: 0;
+    border: 0;
+    background: transparent;
+    cursor: zoom-in;
+    line-height: 0;
+  }
+
+  .devlog-card-images img {
+    width: 110px;
+    height: 110px;
+    object-fit: cover;
+    border-radius: 6px;
+    border: 1px solid #2e2a26;
+    display: block;
+    transition: transform 0.15s ease;
+  }
+
+  .devlog-card-image-btn:hover img {
+    transform: scale(1.04);
+  }
+
+  /* Lightbox */
+  .devlog-lightbox {
+    position: fixed;
+    inset: 0;
+    z-index: 9999;
+    background: rgba(20, 18, 14, 0.88);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 32px;
+    cursor: zoom-out;
+    backdrop-filter: blur(4px);
+  }
+
+  .devlog-lightbox img {
+    max-width: 100%;
+    max-height: 100%;
+    object-fit: contain;
+    border-radius: 6px;
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.6);
+    cursor: default;
+  }
+
+  .devlog-lightbox-close {
+    position: absolute;
+    top: 18px;
+    right: 22px;
+    width: 40px;
+    height: 40px;
+    border-radius: 50%;
+    border: 0;
+    background: rgba(0, 0, 0, 0.55);
+    color: #fff;
+    font-size: 26px;
+    line-height: 38px;
+    text-align: center;
+    cursor: pointer;
+    padding: 0;
+  }
+
+  .devlog-lightbox-close:hover {
+    background: rgba(0, 0, 0, 0.75);
+  }
+
   /* ── shop ────────────────────────────────────────── */
   .section-shop {
     background: #56494a;
@@ -3485,6 +4966,249 @@
     padding: 10px 18px;
     flex-shrink: 0;
     clip-path: polygon(0% 3%, 2% 0%, 98% 1%, 100% 4%, 99% 96%, 97% 100%, 3% 99%, 0% 95%);
+  }
+
+  .shop-header-actions {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    flex-shrink: 0;
+  }
+
+  .suggestions-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    background: #4b4840;
+    color: #e6f4fe;
+    border: 2px solid #1a1a1a;
+    padding: 10px 16px;
+    font-family: "Stone Breaker", "Courier New", monospace;
+    font-size: 14px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    cursor: pointer;
+    transition: background 0.15s, transform 0.1s;
+    box-shadow: 2px 2px 0 rgba(0, 0, 0, 0.4);
+  }
+  .suggestions-btn:hover {
+    background: #6c6659;
+    transform: translate(-1px, -1px);
+    box-shadow: 3px 3px 0 rgba(0, 0, 0, 0.4);
+  }
+  .suggestions-btn:active {
+    transform: translate(1px, 1px);
+    box-shadow: 1px 1px 0 rgba(0, 0, 0, 0.4);
+  }
+  .suggestions-icon {
+    width: 18px;
+    height: 18px;
+  }
+
+  .suggestions-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.65);
+    z-index: 9999;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+  }
+
+  .suggestions-modal {
+    background: #cbc1ae;
+    border: 2px solid #1a1a1a;
+    box-shadow: 6px 6px 0 rgba(0, 0, 0, 0.4);
+    width: 100%;
+    max-width: 600px;
+    max-height: 85vh;
+    overflow-y: auto;
+    padding: 28px 28px 24px;
+    position: relative;
+    color: #4b4840;
+  }
+
+  .suggestions-close {
+    position: absolute;
+    top: 12px;
+    right: 14px;
+    background: transparent;
+    border: none;
+    font-size: 28px;
+    line-height: 1;
+    color: #4b4840;
+    cursor: pointer;
+    padding: 4px 8px;
+  }
+  .suggestions-close:hover { color: #c48382; }
+
+  .suggestions-title {
+    font-family: "Stone Breaker", "Courier New", monospace;
+    font-size: 28px;
+    margin: 0 0 4px;
+    color: #4b4840;
+  }
+  .suggestions-subtitle {
+    font-family: "Courier New", monospace;
+    font-size: 13px;
+    color: #6c6659;
+    margin: 0 0 20px;
+  }
+
+  .suggestions-new {
+    background: rgba(255, 255, 255, 0.4);
+    border: 2px solid #4b4840;
+    padding: 12px;
+    margin-bottom: 20px;
+  }
+  .suggestions-input {
+    width: 100%;
+    min-height: 60px;
+    background: #fff;
+    border: 1px solid #6c6659;
+    padding: 8px 10px;
+    font-family: "Courier New", monospace;
+    font-size: 14px;
+    color: #4b4840;
+    resize: vertical;
+    box-sizing: border-box;
+  }
+  .suggestions-input:focus {
+    outline: 2px solid #93b4cd;
+    outline-offset: 1px;
+  }
+  .suggestions-new-footer {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-top: 8px;
+  }
+  .suggestions-counter {
+    font-family: "Courier New", monospace;
+    font-size: 11px;
+    color: #6c6659;
+  }
+  .suggestions-submit {
+    background: #5a9e6f;
+    color: #fff;
+    border: 2px solid #1a1a1a;
+    padding: 8px 18px;
+    font-family: "Stone Breaker", "Courier New", monospace;
+    font-size: 13px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    cursor: pointer;
+    box-shadow: 2px 2px 0 rgba(0, 0, 0, 0.3);
+  }
+  .suggestions-submit:hover:not(:disabled) {
+    background: #6cb482;
+  }
+  .suggestions-submit:disabled {
+    background: #7f796d;
+    cursor: not-allowed;
+    opacity: 0.6;
+  }
+  .suggestions-error {
+    color: #c48382;
+    font-family: "Courier New", monospace;
+    font-size: 13px;
+    margin: 8px 0 0;
+  }
+
+  .suggestions-list {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .suggestions-empty {
+    text-align: center;
+    color: #6c6659;
+    font-family: "Courier New", monospace;
+    padding: 24px 0;
+  }
+
+  .suggestion-row {
+    display: flex;
+    align-items: stretch;
+    gap: 12px;
+    background: rgba(255, 255, 255, 0.5);
+    border: 1px solid #6c6659;
+    padding: 10px 12px;
+  }
+
+  .suggestion-vote {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 2px;
+    min-width: 56px;
+    background: #fff;
+    border: 2px solid #6c6659;
+    color: #4b4840;
+    padding: 6px 8px;
+    cursor: pointer;
+    font-family: "Stone Breaker", "Courier New", monospace;
+    transition: background 0.15s, color 0.15s, border-color 0.15s, transform 0.1s;
+  }
+  .suggestion-vote svg { width: 16px; height: 16px; }
+  .suggestion-vote-count { font-size: 16px; line-height: 1; }
+  .suggestion-vote:hover {
+    background: #e6f4fe;
+    border-color: #4b4840;
+  }
+  .suggestion-vote.voted {
+    background: #5a9e6f;
+    border-color: #1a1a1a;
+    color: #fff;
+  }
+  .suggestion-vote.voted:hover {
+    background: #6cb482;
+  }
+
+  .suggestion-body {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 4px;
+    min-width: 0;
+  }
+  .suggestion-text {
+    margin: 0;
+    font-family: "Courier New", monospace;
+    font-size: 14px;
+    color: #4b4840;
+    word-break: break-word;
+  }
+  .suggestion-meta {
+    margin: 0;
+    font-family: "Courier New", monospace;
+    font-size: 11px;
+    color: #6c6659;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .suggestion-delete {
+    background: transparent;
+    border: none;
+    color: #c48382;
+    cursor: pointer;
+    font-family: "Courier New", monospace;
+    font-size: 11px;
+    text-decoration: underline;
+    padding: 0;
+  }
+  .suggestion-delete:hover { color: #a05c5b; }
+
+  @media (max-width: 480px) {
+    .shop-header-actions {
+      gap: 8px;
+    }
+    .suggestions-btn span { display: none; }
+    .suggestions-btn { padding: 10px; }
   }
 
   .pipe-img {
@@ -3555,11 +5279,39 @@
     clip-path: polygon(0% 0.5%, 2% 0%, 6% 0.5%, 10% 0%, 16% 0.4%, 22% 0%, 28% 0.5%, 34% 0%, 40% 0.4%, 46% 0%, 52% 0.5%, 58% 0%, 64% 0.4%, 70% 0%, 76% 0.5%, 82% 0%, 88% 0.4%, 94% 0%, 98% 0.5%, 100% 0%, 100% 5%, 99.4% 10%, 100% 16%, 99.5% 22%, 100% 28%, 99.4% 34%, 100% 40%, 99.5% 46%, 100% 52%, 99.4% 58%, 100% 64%, 99.5% 70%, 100% 76%, 99.4% 82%, 100% 88%, 99.5% 94%, 100% 99.5%, 98% 100%, 94% 99.5%, 88% 100%, 82% 99.6%, 76% 100%, 70% 99.5%, 64% 100%, 58% 99.6%, 52% 100%, 46% 99.5%, 40% 100%, 34% 99.6%, 28% 100%, 22% 99.5%, 16% 100%, 10% 99.6%, 6% 100%, 2% 99.5%, 0% 100%, 0% 94%, 0.5% 88%, 0% 82%, 0.6% 76%, 0% 70%, 0.5% 64%, 0% 58%, 0.6% 52%, 0% 46%, 0.5% 40%, 0% 34%, 0.6% 28%, 0% 22%, 0.5% 16%, 0% 10%, 0.6% 5%);
   }
 
+  .shop-featured-section {
+    margin-bottom: 32px;
+  }
+
+  .shop-section-title {
+    margin: 0 0 14px 0;
+    font-family: "Stone Breaker", "Courier New", monospace;
+    font-size: clamp(28px, 3vw, 42px);
+    letter-spacing: 0.04em;
+    color: #e6f4fe;
+    text-shadow: 0 2px 6px rgba(0, 0, 0, 0.4);
+  }
+
   .shop-grid {
     display: grid;
     grid-template-columns: repeat(3, 1fr);
     gap: 20px;
-    justify-content: center;
+    justify-content: start;
+  }
+
+  .shop-grid-featured {
+    /* match the all-items grid: same 3 cols, left-aligned */
+    grid-template-columns: repeat(3, 1fr);
+    justify-content: start;
+  }
+
+  .shop-card-featured {
+    border-color: #b07d3a;
+    box-shadow: 6px 6px 0 #b07d3a;
+  }
+
+  .shop-card-featured:hover {
+    box-shadow: 9px 9px 0 #b07d3a;
   }
 
   .shop-card {
@@ -3648,6 +5400,124 @@
     font-weight: 700;
   }
 
+  .my-orders {
+    margin-top: 32px;
+    padding-top: 20px;
+    border-top: 2px dashed rgba(75, 72, 64, 0.4);
+  }
+
+  .my-orders-title {
+    margin: 0 0 12px;
+    font-family: "Stone Breaker", "Courier New", monospace;
+    font-size: 22px;
+    color: #4b4840;
+  }
+
+  .my-orders-empty {
+    margin: 0;
+    font-family: "Sunny Mood", "Courier New", monospace;
+    font-size: 13px;
+    color: #6c6659;
+  }
+
+  .my-orders-error {
+    margin: 0 0 10px;
+    font-family: "Sunny Mood", "Courier New", monospace;
+    font-size: 13px;
+    color: #c48382;
+  }
+
+  .my-orders-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .my-orders-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 10px 14px;
+    background: #cbc1ae;
+    border: 2px solid #3a3832;
+    box-shadow: 4px 4px 0 #3a3832;
+  }
+
+  .my-orders-info {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+  }
+
+  .my-orders-name {
+    font-family: "Sunny Mood", "Courier New", monospace;
+    font-size: 15px;
+    font-weight: 600;
+    color: #4b4840;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .my-orders-meta {
+    font-family: "Sunny Mood", "Courier New", monospace;
+    font-size: 12px;
+    color: #6c6659;
+  }
+
+  .my-orders-actions {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-shrink: 0;
+  }
+
+  .my-orders-status {
+    font-family: "Sunny Mood", "Courier New", monospace;
+    font-size: 11px;
+    padding: 3px 8px;
+    border-radius: 4px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+
+  .my-orders-status.pending {
+    background: rgba(196, 131, 130, 0.2);
+    color: #8a4a49;
+  }
+
+  .my-orders-status.fulfilled {
+    background: rgba(75, 72, 64, 0.15);
+    color: #4b4840;
+  }
+
+  .my-orders-refund {
+    font-family: "Sunny Mood", "Courier New", monospace;
+    font-size: 13px;
+    padding: 6px 12px;
+    background: #f0ebe5;
+    border: 2px solid #3a3832;
+    box-shadow: 2px 2px 0 #3a3832;
+    color: #4b4840;
+    cursor: pointer;
+    transition: transform 100ms ease, box-shadow 100ms ease;
+  }
+
+  .my-orders-refund:hover:not(:disabled) {
+    transform: translate(-1px, -1px);
+    box-shadow: 3px 3px 0 #3a3832;
+  }
+
+  .my-orders-refund:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+  }
+
   .shop-card-skeleton {
     background: rgba(255,255,255,0.05);
     border: 2px solid rgba(255,255,255,0.08);
@@ -3671,6 +5541,81 @@
 
   .shop-card-skeleton .skeleton-line.wide { width: 80%; }
   .shop-card-skeleton .skeleton-line.narrow { width: 40%; }
+
+  /* ── intent prompt ── */
+  .intent-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.78);
+    z-index: 1100;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    backdrop-filter: blur(6px);
+    animation: fadeIn 200ms ease;
+    padding: 1rem;
+    opacity: 1;
+    transition: opacity 500ms ease;
+  }
+  .intent-overlay.intent-hide {
+    opacity: 0;
+    pointer-events: none;
+  }
+  .intent-modal {
+    background: #4b4840;
+    color: #e8e0d4;
+    border: 1px solid #6c6659;
+    border-radius: 14px;
+    padding: 2rem 1.75rem;
+    width: 100%;
+    max-width: 420px;
+    text-align: center;
+    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+  }
+  .intent-title {
+    margin: 0 0 0.35rem;
+    font-size: 1.5rem;
+  }
+  .intent-sub {
+    margin: 0 0 1.5rem;
+    opacity: 0.75;
+    font-size: 0.95rem;
+  }
+  .intent-options {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1rem;
+  }
+  .intent-btn {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 1.25rem 0.75rem;
+    border-radius: 12px;
+    border: 1px solid #6c6659;
+    background: #52504a;
+    color: #e8e0d4;
+    font-size: 1rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: transform 120ms ease, background 120ms ease, border-color 120ms ease;
+  }
+  .intent-btn:hover:not(:disabled) {
+    background: #5d5a52;
+    border-color: #93b4cd;
+    transform: translateY(-2px);
+  }
+  .intent-btn:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+  }
+  .intent-error {
+    margin: 1rem 0 0;
+    color: #ffb3b3;
+    font-size: 0.85rem;
+  }
 
   /* ── shop modal ── */
   .shop-modal-overlay {
@@ -3835,30 +5780,8 @@
     border: 3px solid #3a3832;
   }
 
-  .qty-btn {
-    width: 40px;
-    height: 40px;
-    background: #8a7f6f;
-    border: none;
-    color: #e6f4fe;
-    font-family: "Stone Breaker", "Courier New", monospace;
-    font-size: 22px;
-    cursor: pointer;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    transition: background 120ms ease;
-  }
-
-  .qty-btn:hover:not(:disabled) { background: #6c6659; }
-  .qty-btn:disabled { opacity: 0.4; cursor: not-allowed; }
-
-  .qty-btn:active:not(:disabled) {
-    transform: scale(0.92);
-  }
-
-  .qty-value {
-    width: 48px;
+  .qty-input {
+    width: 96px;
     text-align: center;
     font-family: "Stone Breaker", "Courier New", monospace;
     font-size: 20px;
@@ -3866,8 +5789,14 @@
     background: #e6e0d4;
     height: 40px;
     line-height: 40px;
-    border-left: 2px solid #3a3832;
-    border-right: 2px solid #3a3832;
+    border: none;
+    padding: 0 8px;
+    outline: none;
+    -moz-appearance: textfield;
+  }
+
+  .qty-input:focus {
+    background: #f1ecdf;
   }
 
   .shop-modal-total {
@@ -3960,6 +5889,122 @@
   .section-projects {
     background: #635a4e;
     padding-top: 48px;
+  }
+
+  .event-countdown {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    flex: 1 1 420px;
+    max-width: 760px;
+    min-width: 260px;
+    margin: 0;
+    padding: 10px 12px;
+    background: rgba(75, 72, 64, 0.58);
+    border: 2px solid rgba(230, 244, 254, 0.16);
+    box-shadow: 5px 5px 0 rgba(0, 0, 0, 0.14);
+  }
+
+  .event-countdown-kicker {
+    margin: 0;
+    font-family: "Sunny Mood", "Courier New", monospace;
+    font-size: 16px;
+    color: #cbc1ae;
+    white-space: nowrap;
+  }
+
+  .event-countdown-logo {
+    font-family: "Stone Breaker", "Courier New", monospace;
+    font-size: 24px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    line-height: 1;
+    color: #e6f4fe;
+  }
+
+  .event-countdown-title {
+    margin: 0;
+    font-family: "Stone Breaker", "Courier New", monospace;
+    font-size: clamp(30px, 3.6vw, 50px);
+    line-height: 0.95;
+    color: #e6f4fe;
+    letter-spacing: 0;
+  }
+
+  .event-countdown-grid {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(48px, 1fr));
+    gap: 6px;
+    min-width: min(100%, 250px);
+  }
+
+  .event-countdown-unit {
+    display: grid;
+    place-items: center;
+    min-height: 54px;
+    padding: 6px;
+    background: #586063;
+    border: 1px solid rgba(230, 244, 254, 0.22);
+    box-shadow: 3px 3px 0 rgba(0, 0, 0, 0.16);
+  }
+
+  .event-countdown-unit strong {
+    font-family: "Stone Breaker", "Courier New", monospace;
+    font-size: clamp(20px, 2vw, 30px);
+    line-height: 1;
+    color: #93b4cd;
+  }
+
+  .event-countdown-unit span {
+    font-family: "Sunny Mood", "Courier New", monospace;
+    font-size: 12px;
+    color: #e6f4fe;
+  }
+
+  .event-countdown-live {
+    margin: 0;
+    font-family: "Stone Breaker", "Courier New", monospace;
+    font-size: clamp(24px, 3vw, 38px);
+    color: #93b4cd;
+  }
+
+  @media (max-width: 760px) {
+    .event-countdown {
+      align-items: center;
+      flex: 0 0 auto;
+      flex-direction: row;
+      flex-wrap: wrap;
+      gap: 8px 10px;
+      width: 100%;
+      max-width: none;
+      min-width: 0;
+      padding: 10px;
+    }
+
+    .event-countdown-kicker {
+      flex: 1 1 100%;
+      white-space: normal;
+    }
+
+    .event-countdown-logo {
+      font-size: 22px;
+    }
+
+    .event-countdown-grid {
+      flex: 1 1 100%;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      min-width: 0;
+    }
+
+    .event-countdown-unit {
+      min-height: 48px;
+      padding: 5px;
+    }
+
+    .event-countdown-unit strong {
+      font-size: 22px;
+    }
   }
 
   .progress-bar-wrap {
@@ -4095,10 +6140,9 @@
   }
 
   .projects-box.has-projects {
-    display: grid;
-    grid-template-columns: repeat(var(--cols, 1), 1fr);
-    align-items: stretch;
-    justify-content: start;
+    display: block;
+    column-count: var(--cols, 1);
+    column-gap: 12px;
     min-height: 0;
   }
 
@@ -4238,6 +6282,24 @@
     text-align: center;
   }
 
+  .shipping-prompt-poll {
+    font-family: "Courier New", monospace;
+    font-size: 13px;
+    color: #9e9888;
+    line-height: 1.5;
+    margin-top: 12px;
+    text-align: center;
+  }
+
+  .shipping-prompt-poll.shipping-prompt-success {
+    color: #4a7a3a;
+    font-weight: bold;
+  }
+
+  .shipping-recheck-btn {
+    margin-top: 8px;
+  }
+
   .review-checklist {
     display: flex;
     flex-direction: column;
@@ -4358,6 +6420,8 @@
     );
     cursor: pointer;
     transition: background 150ms ease;
+    break-inside: avoid;
+    margin-bottom: 12px;
   }
 
   .project-card:hover {
@@ -4532,14 +6596,42 @@
   }
 
   .new-project-btn {
-    align-self: center;
     width: fit-content;
-    margin-top: 12px;
     flex-shrink: 0;
     font-family: "Sunny Mood", "Courier New", monospace;
     font-size: 17px;
     text-shadow: 2px 2px 0 rgba(0, 0, 0, 0.3);
     padding: 8px 20px;
+  }
+
+  .project-actions-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    align-items: center;
+    justify-content: center;
+    margin-top: 12px;
+  }
+
+  /* Match .new-project-btn's font, padding, and box exactly — only the colors
+     differ (plain white + black instead of red) so the two sit as twins. */
+  .guide-btn {
+    width: fit-content;
+    flex-shrink: 0;
+    font-family: "Sunny Mood", "Courier New", monospace;
+    font-size: 17px;
+    padding: 8px 20px;
+    text-decoration: none;
+    background: #ffffff;
+    color: #000000;
+    border: 3px solid #000000;
+    border-bottom: 8px solid #000000;
+    box-shadow: 4px 4px 0 #3a3832;
+    text-shadow: none;
+  }
+
+  .guide-btn:hover {
+    background: #f0ece4;
   }
 
   /* ── explore ─────────────────────────────────────── */
@@ -5245,6 +7337,34 @@
     color: #cbc1ae;
   }
 
+  .lb-show-more {
+    margin-top: 12px;
+    padding: 10px 24px;
+    background: transparent;
+    border: 2px solid rgba(230, 244, 254, 0.2);
+    border-bottom: 5px solid rgba(230, 244, 254, 0.1);
+    color: #cbc1ae;
+    font-family: "Courier New", monospace;
+    font-size: 14px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    cursor: pointer;
+    width: 100%;
+    max-width: 600px;
+    transition: background 150ms ease, border-color 150ms ease, transform 0.1s ease, border-bottom-width 0.1s ease;
+  }
+
+  .lb-show-more:hover {
+    background: rgba(230, 244, 254, 0.06);
+    border-color: rgba(230, 244, 254, 0.35);
+  }
+
+  .lb-show-more:active {
+    transform: translateY(3px);
+    border-bottom-width: 2px;
+  }
+
   .skeleton-text {
     display: inline-block;
     height: 14px;
@@ -5279,7 +7399,7 @@
     min-height: 100%;
     padding: 2rem 3rem;
     position: relative;
-    overflow-x: clip;
+    overflow-x: hidden;
   }
 
   .faq-page::after {
@@ -5453,6 +7573,11 @@
     word-break: break-all;
   }
 
+  .account-link {
+    color: #93b4cd;
+    text-decoration: underline;
+  }
+
   .nickname-form {
     display: flex;
     align-items: baseline;
@@ -5498,7 +7623,7 @@
   .gender-select {
     font-family: "Courier New", monospace;
     font-size: 15px;
-    color: #000;
+    color: #cbc1ae;
     background: rgba(0, 0, 0, 0.25);
     border: 1px solid rgba(203, 193, 174, 0.3);
     padding: 4px 8px;
@@ -5698,70 +7823,9 @@
     padding: 14px;
     font-family: "Stone Breaker", "Courier New", monospace;
     font-size: 22px;
-    color: #93b4cd;
+    color: #000;
     text-align: center;
     text-shadow: 2px 2px 0 rgba(0, 0, 0, 0.3);
-  }
-
-  /* ── mobile warning ───────────────────────────────── */
-  .mobile-warning {
-    display: none;
-    position: fixed;
-    inset: 0;
-    z-index: 9999;
-    background: #4b4840;
-    align-items: center;
-    justify-content: center;
-    padding: 32px;
-  }
-
-  .mobile-warning-inner {
-    text-align: center;
-    max-width: 360px;
-  }
-
-  .mobile-warning-icon {
-    width: 48px;
-    height: 48px;
-    color: #c48382;
-    margin-bottom: 20px;
-  }
-
-  .mobile-warning-text {
-    font-family: "Stone Breaker", "Courier New", monospace;
-    font-size: 18px;
-    color: #cbc1ae;
-    line-height: 1.5;
-    margin: 0;
-  }
-
-  .mobile-warning-text strong {
-    font-family: "Stone Breaker", "Courier New", monospace;
-    font-size: 20px;
-    color: #e6f4fe;
-  }
-
-  .mobile-warning-dismiss {
-    margin-top: 24px;
-    padding: 10px 28px;
-    font-family: "Stone Breaker", "Courier New", monospace;
-    font-size: 16px;
-    color: #e6f4fe;
-    background: rgba(230, 244, 254, 0.1);
-    border: 1px solid rgba(230, 244, 254, 0.25);
-    border-radius: 6px;
-    cursor: pointer;
-  }
-
-  @media (max-width: 600px) {
-    .mobile-warning {
-      display: flex;
-    }
-
-    .mobile-warning-active .sidebar,
-    .mobile-warning-active .main {
-      display: none;
-    }
   }
 
   /* ── responsive ─────────────────────────────────── */
@@ -5775,7 +7839,9 @@
   }
 
   @media (max-width: 900px) {
-    .sidebar {
+    .sidebar,
+    .sidebar.pinned,
+    .sidebar:hover {
       position: fixed;
       top: auto;
       bottom: 0;
@@ -5788,21 +7854,29 @@
       transition: none;
     }
 
-    .sidebar:hover {
-      width: 100%;
-    }
-
     .teeth,
-    .sidebar-panel {
+    .expand-hint {
       display: none;
     }
 
+    .sidebar-panel {
+      position: static;
+      max-width: 100%;
+      width: 100%;
+      height: auto;
+      background: transparent;
+    }
+
     .sidebar-content {
+      position: static;
       flex-direction: row;
       align-items: center;
       padding: 0;
       width: 100%;
+      height: auto;
       opacity: 1;
+      transform: none;
+      overflow: visible;
       transition: none;
     }
 
@@ -5823,12 +7897,28 @@
     .nav-btn {
       flex-direction: column;
       align-items: center;
+      justify-content: center;
       gap: 2px;
-      padding: 8px 4px;
-      font-size: 10px;
+      padding: 18px 2px;
+      font-size: clamp(10px, 2.6vw, 13px);
+      line-height: 1;
+      letter-spacing: 0.02em;
       border-radius: 4px;
       border-width: 2px;
       border-bottom-width: 4px;
+      white-space: nowrap;
+      min-width: 0;
+    }
+
+    .sidebar-nav li {
+      flex: 1 1 0;
+      min-width: 0;
+      display: flex;
+    }
+
+    /* Reserve room for the now-taller bottom nav */
+    .main {
+      padding-bottom: 96px !important;
     }
 
     .nav-btn:active {
@@ -5933,6 +8023,158 @@
       flex-direction: column;
     }
 
+    /* Strip noisy desktop-only widgets on mobile */
+    .bottom-row,
+    .sticker-promo,
+    .progress-key,
+    .mobile-only-hide {
+      display: none !important;
+    }
+
+    .section-header {
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .progress-bar-wrap {
+      width: 100%;
+      max-width: none;
+      min-width: 0;
+      margin-top: 4px;
+    }
+
+    /* Single-column project list on mobile */
+    .projects-box.has-projects {
+      column-count: 1 !important;
+    }
+
+    /* Stack thumb above info so description has room */
+    .project-card {
+      flex-direction: column;
+      gap: 14px;
+      padding: 20px 16px 16px;
+    }
+
+    .project-card.landscape .project-thumb,
+    .project-card:not(.landscape) .project-thumb,
+    .cat-placeholder {
+      width: 100% !important;
+      max-width: 100%;
+      height: auto;
+      align-self: stretch;
+    }
+
+    .project-card.landscape .project-thumb {
+      aspect-ratio: 16 / 9;
+    }
+
+    .project-header-row {
+      flex-wrap: wrap;
+    }
+
+    .project-desc {
+      font-size: 16px;
+    }
+
+    .section-title {
+      font-size: clamp(24px, 7vw, 32px);
+    }
+
+    /* Create / edit form: drop the desktop-style left gutter and side gears */
+    .create-project-form {
+      padding: 24px 16px 32px;
+    }
+
+    .form-gear,
+    .form-row,
+    .form-bottom-row {
+      flex-direction: column;
+    }
+
+    .form-row {
+      display: flex;
+      gap: 16px;
+    }
+
+    .form-actions {
+      margin-left: 0;
+      flex-wrap: wrap;
+    }
+
+    /* Leaderboard: trim columns so rows don't overflow */
+    .leaderboard-table {
+      font-size: 14px;
+    }
+
+    /* Project actions row should wrap rather than overflow */
+    .project-actions-row {
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+
+    /* Shop header: title row should use full width, not be squeezed by actions */
+    .shop-header {
+      flex-direction: column;
+      align-items: stretch;
+      gap: 16px;
+      padding: 20px 18px;
+    }
+    .shop-header-actions {
+      justify-content: space-between;
+    }
+
+    /* Me page: stack the two columns instead of side-by-side */
+    .me-columns {
+      flex-direction: column;
+      gap: 24px;
+    }
+
+    .fulfillment-card {
+      position: static;
+    }
+
+    .account-card {
+      max-width: 100%;
+      margin-top: 0;
+    }
+
+    /* Stack label/value vertically so long emails / IDs don't get split character-by-character */
+    .account-field {
+      flex-direction: column;
+      align-items: stretch;
+      gap: 2px;
+    }
+
+    .account-value {
+      text-align: left;
+      word-break: normal;
+      overflow-wrap: anywhere;
+    }
+
+    .nickname-form {
+      width: 100%;
+    }
+
+    .nickname-input {
+      width: 100%;
+      text-align: left;
+      box-sizing: border-box;
+    }
+  }
+
+  @media (max-width: 600px) {
+    .shop-grid {
+      grid-template-columns: repeat(2, 1fr) !important;
+      gap: 10px;
+    }
+
+    .explore-grid {
+      grid-template-columns: repeat(2, 1fr) !important;
+    }
+
+    .shop-warning-banner {
+      margin: 16px 0;
+    }
   }
 
 

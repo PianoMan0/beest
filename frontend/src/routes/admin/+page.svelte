@@ -2,6 +2,8 @@
 	import DauChart from './DauChart.svelte';
 	import SignupsChart from './SignupsChart.svelte';
 	import UserFunnel from './UserFunnel.svelte';
+	import TimelapsePanel from '$lib/components/admin/TimelapsePanel.svelte';
+	import CardGrantModal from '$lib/components/admin/CardGrantModal.svelte';
 	let { data } = $props();
 
 	interface UserSummary {
@@ -35,6 +37,7 @@
 
 	const isReviewer = $derived(data.role === 'Reviewer' || data.role === 'Fraud Reviewer');
 	const isSuperAdmin = $derived(data.role === 'Super Admin');
+	const canBan = $derived(data.role === 'Super Admin' || data.role === 'Fraud Reviewer');
 	let activeTab = $state('users');
 	let users: UserSummary[] = $state([]);
 	let loading = $state(true);
@@ -55,6 +58,45 @@
 	let newNewsDate = $state('');
 	let newsSaving = $state(false);
 
+	// Events state
+	interface AdminEvent {
+		id: string;
+		title: string;
+		description: string | null;
+		hostedBy: string | null;
+		hostedByName: string | null;
+		hostedBySlackId: string | null;
+		startAt: string;
+		endAt: string | null;
+		url: string | null;
+	}
+	let eventItems: AdminEvent[] = $state([]);
+	let eventHostUsers: UserSummary[] = $state([]);
+	let eventHostsLoading = $state(false);
+	let eventsLoading = $state(false);
+	let editingEvent: AdminEvent | null = $state(null);
+	let newEventTitle = $state('');
+	let newEventDescription = $state('');
+	let newEventHostedBy = $state('');
+	let newEventStartAt = $state('');
+	let newEventEndAt = $state('');
+	let newEventUrl = $state('');
+	let eventSaving = $state(false);
+
+	function toEventApiDate(value: string) {
+		if (!value) return null;
+		const date = new Date(value);
+		return Number.isNaN(date.getTime()) ? null : date.toISOString();
+	}
+
+	function toDateTimeLocalValue(value: string | null) {
+		if (!value) return '';
+		const date = new Date(value);
+		if (Number.isNaN(date.getTime())) return '';
+		const offsetDate = new Date(date.getTime() - date.getTimezoneOffset() * 60_000);
+		return offsetDate.toISOString().slice(0, 16);
+	}
+
 	// Projects state
 	interface ProjectSummary {
 		id: string;
@@ -74,7 +116,7 @@
 		createdAt: string;
 		updatedAt: string;
 		user: { id: string; name: string | null; slackId: string | null };
-		latestSubmission: { id: string; changeDescription: string | null; minHoursConfirmed: boolean; status: string; createdAt: string } | null;
+		latestSubmission: { id: string; changeDescription: string | null; minHoursConfirmed: boolean; reviewerNote: string | null; status: string; createdAt: string } | null;
 	}
 
 	interface StatusCounts {
@@ -96,6 +138,7 @@
 		totalHours: number;
 		earliestHeartbeat: number | null;
 		previousApprovedHours: number;
+		previousInternalHours: number;
 		trustLevel: string | null;
 		linkedBanned: boolean;
 		linkedEmail: string | null;
@@ -104,6 +147,7 @@
 		beestSlackId: string | null;
 		emailMismatch: boolean;
 		hackatimeProjects: { name: string; hours: number; languages: string[]; firstHeartbeat: number | null }[];
+		categories?: { name: string; totalSeconds: number; percent: number }[];
 		unifiedDuplicate: boolean;
 		unifiedError: boolean;
 	}
@@ -118,6 +162,14 @@
 	let customHours = $state(0);
 	let userFacingHours = $state(0);
 
+	// Reviewer must add their own reasoning beyond the auto-generated template
+	// (~180 chars) before approving or rejecting. Server enforces the same floor.
+	const JUSTIFICATION_MIN = 250;
+	let justificationOk = $derived(overrideJustification.trim().length >= JUSTIFICATION_MIN);
+	let justificationCharsRemaining = $derived(
+		Math.max(0, JUSTIFICATION_MIN - overrideJustification.trim().length),
+	);
+
 	let selectedProject = $derived(allProjects.find(p => p.id === expandedProjectId) ?? null);
 	let projScreenIdx = $state(0);
 
@@ -131,6 +183,32 @@
 		createdAt: string;
 	}
 	let pastReviews = $state<ReviewRecord[]>([]);
+
+	type DevlogRecord = {
+		id: string;
+		projectId: string | null;
+		userId: string;
+		userName: string | null;
+		title: string;
+		text: string;
+		imageUrls: string[];
+		createdAt: string;
+	};
+	let projectDevlogs = $state<DevlogRecord[]>([]);
+	let devlogLightbox = $state<string | null>(null);
+	function openDevlogLightbox(url: string) { devlogLightbox = url; }
+	function closeDevlogLightbox() { devlogLightbox = null; }
+	function onDevlogLightboxKey(e: KeyboardEvent) { if (e.key === 'Escape') closeDevlogLightbox(); }
+
+	async function loadProjectDevlogs(projectId: string) {
+		try {
+			const res = await fetch(`/api/admin/projects/${projectId}/devlogs`);
+			if (res.ok) projectDevlogs = await res.json();
+			else projectDevlogs = [];
+		} catch {
+			projectDevlogs = [];
+		}
+	}
 
 	async function reviewProject(status: 'approved' | 'changes_needed' | 'ban') {
 		if (!expandedProjectId || reviewSubmitting) return;
@@ -200,15 +278,23 @@
 		const htNames = (hackatimeData.hackatimeProjects ?? []).map(p => p.name).join(', ');
 		const htNamesNote = htNames ? `\nHackatime projects: ${htNames}` : '';
 		const prevHours = hackatimeData.previousApprovedHours ?? 0;
-		const deltaNote = prevHours > 0 ? `\nPreviously approved: ${prevHours}h — delta: ${Math.round((adjustedHours - prevHours) * 10) / 10}h` : '';
-		const next = `the user tracked ${hackatimeData.totalHours} hours on the project through hackatime (${label} to ${adjustedHours}h)${updateNote}${htNamesNote}${deltaNote}\n\nsigned off by ${data.user.name ?? 'unknown'}`;
+		// adjustedHours is the DELTA of new hours the reviewer is approving on this
+		// ship (cumulative on an initial ship). Project total after this approval
+		// is prevHours + adjustedHours.
+		const deltaNote = prevHours > 0 ? `\nPreviously approved: ${prevHours}h — this ship's delta: ${adjustedHours}h (project total after: ${Math.round((prevHours + adjustedHours) * 10) / 10}h)` : '';
+		const next = `the user tracked ${hackatimeData.totalHours} hours on the project through hackatime (${label} to ${adjustedHours}h of new work)${updateNote}${htNamesNote}${deltaNote}\n\nsigned off by ${data.user.name ?? 'unknown'}`;
 		overrideJustification = next;
 		lastAutoJustification = next;
 	}
 
 	function adjustHours(factor: number) {
 		if (!hackatimeData) return;
-		const adjusted = Math.round(hackatimeData.totalHours * factor * 10) / 10;
+		// Reviewer is approving the DELTA (new hours since last approval) on a
+		// reship, or the cumulative on an initial ship. The delta-of-Hackatime
+		// is what they should be scaling.
+		const prev = hackatimeData.previousInternalHours ?? 0;
+		const deltaHt = Math.max(0, hackatimeData.totalHours - prev);
+		const adjusted = Math.round(deltaHt * factor * 10) / 10;
 		customHours = adjusted;
 		const label = factor === 0.5 ? 'halved' : factor === 1/3 ? 'reduced to a third' : `reduced to ${Math.round(factor * 100)}%`;
 		buildJustification(adjusted, label);
@@ -228,7 +314,9 @@
 		const htNames = (hackatimeData?.hackatimeProjects ?? []).map(p => p.name).join(', ');
 		const htNamesNote = htNames ? `\nHackatime projects: ${htNames}` : '';
 		const prevHours = hackatimeData?.previousApprovedHours ?? 0;
-		const deltaNote = prevHours > 0 ? `\nPreviously approved: ${prevHours}h — delta: ${Math.round((customHours - prevHours) * 10) / 10}h` : '';
+		// customHours is the DELTA of new hours the reviewer is approving on this
+		// ship (cumulative on an initial ship). Project total after = prev + delta.
+		const deltaNote = prevHours > 0 ? `\nPreviously approved: ${prevHours}h — this ship's delta: ${customHours}h (project total after: ${Math.round((prevHours + customHours) * 10) / 10}h)` : '';
 		const next = `the user tracked ${hackatimeData?.totalHours ?? 0} hours on the project through hackatime${updateNote}${htNamesNote}${deltaNote}${unifiedNote}\n\nsigned off by ${data.user.name ?? 'unknown'}`;
 		overrideJustification = next;
 		lastAutoJustification = next;
@@ -240,6 +328,7 @@
 			hackatimeData = null;
 			userFeedback = '';
 		internalNote = '';
+			projectDevlogs = [];
 			return;
 		}
 		expandedProjectId = projectId;
@@ -250,9 +339,11 @@
 		overrideJustification = '';
 		lastAutoJustification = '';
 		pastReviews = [];
+		projectDevlogs = [];
 
 		const proj = allProjects.find(p => p.id === projectId);
 		loadReviews(projectId);
+		loadProjectDevlogs(projectId);
 		if (proj?.status === 'unreviewed' || proj?.status === 'approved') {
 			hackatimeLoading = true;
 			try {
@@ -260,14 +351,20 @@
 				if (res.ok) {
 					hackatimeData = await res.json();
 				} else {
-					hackatimeData = { totalHours: 0, earliestHeartbeat: null, previousApprovedHours: 0, hackatimeProjects: [], trustLevel: null, linkedBanned: false, linkedEmail: null, linkedSlackUid: null, beestEmail: null, beestSlackId: null, emailMismatch: false, unifiedDuplicate: false, unifiedError: true };
+					hackatimeData = { totalHours: 0, earliestHeartbeat: null, previousApprovedHours: 0, previousInternalHours: 0, hackatimeProjects: [], trustLevel: null, linkedBanned: false, linkedEmail: null, linkedSlackUid: null, beestEmail: null, beestSlackId: null, emailMismatch: false, unifiedDuplicate: false, unifiedError: true };
 				}
 			} catch {
-				hackatimeData = { totalHours: 0, earliestHeartbeat: null, previousApprovedHours: 0, hackatimeProjects: [], trustLevel: null, linkedBanned: false, linkedEmail: null, linkedSlackUid: null, beestEmail: null, beestSlackId: null, emailMismatch: false, unifiedDuplicate: false, unifiedError: true };
+				hackatimeData = { totalHours: 0, earliestHeartbeat: null, previousApprovedHours: 0, previousInternalHours: 0, hackatimeProjects: [], trustLevel: null, linkedBanned: false, linkedEmail: null, linkedSlackUid: null, beestEmail: null, beestSlackId: null, emailMismatch: false, unifiedDuplicate: false, unifiedError: true };
 			} finally {
 				hackatimeLoading = false;
-				customHours = hackatimeData?.totalHours ?? 0;
-				userFacingHours = hackatimeData?.totalHours ?? 0;
+				// Default the reviewer's inputs to the DELTA of new Hackatime work
+				// since the last approval. For initial ships previousApprovedHours/
+				// previousInternalHours are 0, so the delta = total cumulative.
+				const totalHt = hackatimeData?.totalHours ?? 0;
+				const prevOverride = hackatimeData?.previousApprovedHours ?? 0;
+				const prevInternal = hackatimeData?.previousInternalHours ?? 0;
+				customHours = Math.max(0, Math.round((totalHt - prevInternal) * 10) / 10);
+				userFacingHours = Math.max(0, Math.round((totalHt - prevOverride) * 10) / 10);
 				buildInitialJustification(proj);
 			}
 		}
@@ -304,6 +401,25 @@
 	const totalUsers = $derived(users.length);
 	const totalHackatime = $derived(users.filter(u => u.hackatimeConnected).length);
 
+	let unreviewedHours = $state<{
+		totalHours: number;
+		projectCount: number;
+		approvalRate: number;
+		decisionCount: number;
+		predictedApprovedHours: number;
+	} | null>(null);
+	let unreviewedHoursLoading = $state(false);
+
+	async function loadUnreviewedHours() {
+		unreviewedHoursLoading = true;
+		try {
+			const res = await fetch('/api/admin/stats/unreviewed-hours');
+			if (res.ok) unreviewedHours = await res.json();
+		} finally {
+			unreviewedHoursLoading = false;
+		}
+	}
+
 	let filteredUsers = $derived.by(() => {
 		let result = users;
 		if (permsFilter) {
@@ -328,6 +444,24 @@
 		} finally {
 			loading = false;
 		}
+	}
+
+	async function loadEventHostUsers() {
+		eventHostsLoading = true;
+		try {
+			const res = await fetch('/api/admin/users');
+			if (res.ok) eventHostUsers = await res.json();
+		} finally {
+			eventHostsLoading = false;
+		}
+	}
+
+	function userDisplayName(user: UserSummary) {
+		return user.nickname || user.name || user.email || user.hcaSub;
+	}
+
+	function slackUserUrl(slackId: string) {
+		return `https://hackclub.enterprise.slack.com/team/${encodeURIComponent(slackId)}`;
 	}
 
 	async function selectUser(user: UserSummary) {
@@ -495,6 +629,102 @@
 		}
 	}
 
+	async function loadEvents() {
+		eventsLoading = true;
+		try {
+			const res = await fetch('/api/admin/events');
+			if (res.ok) eventItems = await res.json();
+		} finally {
+			eventsLoading = false;
+		}
+	}
+
+	function resetEventForm() {
+		editingEvent = null;
+		newEventTitle = '';
+		newEventDescription = '';
+		newEventHostedBy = '';
+		newEventStartAt = '';
+		newEventEndAt = '';
+		newEventUrl = '';
+	}
+
+	async function createEvent() {
+		const startAt = toEventApiDate(newEventStartAt);
+		const endAt = toEventApiDate(newEventEndAt);
+		if (!newEventTitle.trim() || !newEventHostedBy.trim() || !startAt) return;
+		eventSaving = true;
+		try {
+			const res = await fetch('/api/admin/events', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					title: newEventTitle,
+					description: newEventDescription,
+					hostedBy: newEventHostedBy,
+					startAt,
+					endAt,
+					url: newEventUrl,
+				}),
+			});
+			if (res.ok) {
+				resetEventForm();
+				await loadEvents();
+			}
+		} finally {
+			eventSaving = false;
+		}
+	}
+
+	async function saveEventEdit() {
+		if (!editingEvent) return;
+		const startAt = toEventApiDate(newEventStartAt);
+		const endAt = toEventApiDate(newEventEndAt);
+		if (!newEventTitle.trim() || !newEventHostedBy.trim() || !startAt) return;
+		eventSaving = true;
+		try {
+			const res = await fetch(`/api/admin/events/${editingEvent.id}`, {
+				method: 'PATCH',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					title: newEventTitle,
+					description: newEventDescription,
+					hostedBy: newEventHostedBy,
+					startAt,
+					endAt,
+					url: newEventUrl,
+				}),
+			});
+			if (res.ok) {
+				editingEvent = null;
+				await loadEvents();
+			}
+		} finally {
+			eventSaving = false;
+		}
+	}
+
+	async function deleteEvent(id: string) {
+		if (!confirm('Delete this event?')) return;
+		eventSaving = true;
+		try {
+			const res = await fetch(`/api/admin/events/${id}`, { method: 'DELETE' });
+			if (res.ok) await loadEvents();
+		} finally {
+			eventSaving = false;
+		}
+	}
+
+	function editEvent(eventItem: AdminEvent) {
+		editingEvent = { ...eventItem };
+		newEventTitle = eventItem.title;
+		newEventDescription = eventItem.description ?? '';
+		newEventHostedBy = eventItem.hostedBySlackId ?? eventItem.hostedBy ?? '';
+		newEventStartAt = toDateTimeLocalValue(eventItem.startAt);
+		newEventEndAt = toDateTimeLocalValue(eventItem.endAt);
+		newEventUrl = eventItem.url ?? '';
+	}
+
 	async function loadProjects() {
 		projectsLoading = true;
 		try {
@@ -552,6 +782,7 @@
 		stock: number | null;
 		sortOrder: number;
 		isActive: boolean;
+		isFeatured: boolean;
 		estimatedShip: string | null;
 	}
 	let shopItemsList: ShopItemAdmin[] = $state([]);
@@ -566,6 +797,7 @@
 	let newShopStock = $state('');
 	let newShopShip = $state('');
 	let newShopActive = $state(true);
+	let newShopFeatured = $state(false);
 	let dragIdx: number | null = $state(null);
 	let dragOverIdx: number | null = $state(null);
 
@@ -594,7 +826,8 @@
 					priceHours: newShopPrice,
 					stock: newShopStock.trim() === '' ? null : parseInt(newShopStock),
 					estimatedShip: newShopShip.trim() || null,
-					isActive: newShopActive
+					isActive: newShopActive,
+					isFeatured: newShopFeatured
 				})
 			});
 			if (res.ok) {
@@ -606,6 +839,7 @@
 				newShopStock = '';
 				newShopShip = '';
 				newShopActive = true;
+				newShopFeatured = false;
 				await loadShop();
 			}
 		} finally {
@@ -628,7 +862,8 @@
 					priceHours: editingShop.priceHours,
 					stock: editingShop.stock,
 					estimatedShip: editingShop.estimatedShip,
-					isActive: editingShop.isActive
+					isActive: editingShop.isActive,
+					isFeatured: editingShop.isFeatured
 				})
 			});
 			if (res.ok) {
@@ -697,10 +932,12 @@
 		quantity: number;
 		pipesSpent: number;
 		status: string;
+		hcbCardGrantId: string | null;
 		createdAt: string;
 		updatedAt: string;
 		userName: string;
 		userSlackId: string | null;
+		userEmail: string | null;
 		pendingSince: number | null;
 	}
 	let fulfillmentOrders: AdminOrder[] = $state([]);
@@ -710,6 +947,76 @@
 	let fulfillmentSortBy = $state<'oldest' | 'newest'>('oldest');
 	let fulfillmentMsg = $state<Record<string, string>>({});
 	let fulfillmentActionLoading = $state('');
+
+	// HCB card grants
+	type HcbStatus = {
+		configured: boolean;
+		connected: boolean;
+		orgId: string | null;
+		connectedByEmail: string | null;
+		connectedAt: string | null;
+		expiresAt: string | null;
+	};
+	let hcbStatus = $state<HcbStatus | null>(null);
+	let grantModalOrder = $state<AdminOrder | null>(null);
+
+	async function loadHcbStatus() {
+		try {
+			const res = await fetch('/api/admin/hcb/status');
+			if (res.ok) hcbStatus = await res.json();
+		} catch {
+			/* leave null — banner just won't render */
+		}
+	}
+
+	function onGrantIssued() {
+		// Reflect the new grant + any status changes immediately.
+		loadFulfillment();
+	}
+
+	type OrderDetail = {
+		address: {
+			streetAddress: string | null;
+			locality: string | null;
+			region: string | null;
+			postalCode: string | null;
+			country: string | null;
+		} | null;
+		addressMissing: boolean;
+		projects: { id: string; name: string; projectType: string | null; hours: number | null; approvedAt: string }[];
+	};
+	let expandedOrderId = $state<string | null>(null);
+	let orderDetails = $state<Record<string, OrderDetail | 'loading' | 'error'>>({});
+	let copiedKey = $state('');
+
+	async function toggleOrderRow(orderId: string) {
+		if (expandedOrderId === orderId) {
+			expandedOrderId = null;
+			return;
+		}
+		expandedOrderId = orderId;
+		if (orderDetails[orderId] && orderDetails[orderId] !== 'error') return;
+		orderDetails[orderId] = 'loading';
+		try {
+			const res = await fetch(`/api/admin/orders/${orderId}/detail`);
+			if (!res.ok) {
+				orderDetails[orderId] = 'error';
+				return;
+			}
+			orderDetails[orderId] = await res.json();
+		} catch {
+			orderDetails[orderId] = 'error';
+		}
+	}
+
+	async function copyAddressLine(key: string, value: string | null | undefined) {
+		if (!value) return;
+		try {
+			await navigator.clipboard.writeText(value);
+			copiedKey = key;
+			setTimeout(() => { if (copiedKey === key) copiedKey = ''; }, 1200);
+		} catch { /* clipboard blocked */ }
+	}
 
 	let fulfillmentItemOptions = $derived([...new Set(fulfillmentOrders.map(o => o.itemName))].sort());
 
@@ -722,6 +1029,25 @@
 			result = result.filter(o => o.itemName === fulfillmentItemFilter);
 		}
 		return result;
+	});
+
+	// For each pending order, count other pending orders by the same user for
+	// the same shop item — these are mergeable into one fulfillment.
+	let mergeableCounts = $derived.by(() => {
+		const counts: Record<string, number> = {};
+		const groups = new Map<string, string[]>();
+		for (const o of fulfillmentOrders) {
+			if (o.status !== 'pending' || !o.shopItemId) continue;
+			const key = `${o.userId}::${o.shopItemId}`;
+			const arr = groups.get(key);
+			if (arr) arr.push(o.id);
+			else groups.set(key, [o.id]);
+		}
+		for (const ids of groups.values()) {
+			if (ids.length < 2) continue;
+			for (const id of ids) counts[id] = ids.length - 1;
+		}
+		return counts;
 	});
 
 	async function loadFulfillment() {
@@ -743,6 +1069,30 @@
 		fulfillmentActionLoading = orderId;
 		try {
 			const res = await fetch(`/api/admin/orders/${orderId}/fulfill`, { method: 'POST' });
+			if (res.ok) await loadFulfillment();
+		} finally {
+			fulfillmentActionLoading = '';
+		}
+	}
+
+	async function mergeOrder(order: AdminOrder) {
+		const dupes = mergeableCounts[order.id] ?? 0;
+		if (dupes < 1) return;
+		if (!confirm(`Merge ${dupes} duplicate pending order(s) for ${order.userName} into this one? The merged orders are removed and the quantity is summed onto this order. The user is not notified.`)) return;
+		fulfillmentActionLoading = order.id;
+		try {
+			const res = await fetch(`/api/admin/orders/${order.id}/merge`, { method: 'POST' });
+			if (res.ok) await loadFulfillment();
+		} finally {
+			fulfillmentActionLoading = '';
+		}
+	}
+
+	async function refundOrder(order: AdminOrder) {
+		if (!confirm(`Refund ${order.quantity}x ${order.itemName} to ${order.userName}? This returns ${order.pipesSpent} Pipes, restocks the item, and removes the order.`)) return;
+		fulfillmentActionLoading = order.id;
+		try {
+			const res = await fetch(`/api/admin/orders/${order.id}/refund`, { method: 'POST' });
 			if (res.ok) await loadFulfillment();
 		} finally {
 			fulfillmentActionLoading = '';
@@ -781,11 +1131,12 @@
 			return;
 		}
 		if (activeTab === 'users') { loadUsers(); }
-		if (activeTab === 'stats') { loadUsers(); }
+		if (activeTab === 'stats') { loadUsers(); if (isSuperAdmin) loadUnreviewedHours(); }
 		if (activeTab === 'news') loadNews();
+		if (activeTab === 'events') { loadEvents(); if (eventHostUsers.length === 0) loadEventHostUsers(); }
 		if (activeTab === 'projects') loadProjects();
 		if (activeTab === 'shop') loadShop();
-		if (activeTab === 'fulfillment') loadFulfillment();
+		if (activeTab === 'fulfillment') { loadFulfillment(); loadHcbStatus(); }
 		if (activeTab === 'leaderboard') loadLeaderboard();
 	});
 </script>
@@ -804,11 +1155,17 @@
 			<button class="tab" class:active={activeTab === 'users'} onclick={() => { activeTab = 'users'; closeDetail(); }}>Users</button>
 			<button class="tab" class:active={activeTab === 'stats'} onclick={() => activeTab = 'stats'}>Stats</button>
 			<button class="tab" class:active={activeTab === 'news'} onclick={() => activeTab = 'news'}>News</button>
+			{#if isSuperAdmin}
+				<button class="tab" class:active={activeTab === 'events'} onclick={() => activeTab = 'events'}>Events</button>
+			{/if}
 			<button class="tab" class:active={activeTab === 'shop'} onclick={() => activeTab = 'shop'}>Shop</button>
 			<button class="tab" class:active={activeTab === 'fulfillment'} onclick={() => activeTab = 'fulfillment'}>Fulfillment</button>
 		{/if}
 		<button class="tab" class:active={activeTab === 'projects'} onclick={() => activeTab = 'projects'}>Projects</button>
 		<button class="tab" class:active={activeTab === 'leaderboard'} onclick={() => activeTab = 'leaderboard'}>Leaderboard</button>
+		{#if isSuperAdmin}
+			<a href="/admin/audit" class="tab tab-audit">Audit</a>
+		{/if}
 		<a href="/home" class="tab tab-home">Home</a>
 	</nav>
 
@@ -848,7 +1205,13 @@
 										<td>{user.name ?? '—'}</td>
 										<td class="mono">{user.email}</td>
 										<td><span class="badge" class:banned={user.perms === 'Banned'}>{user.perms ?? '—'}</span></td>
-										<td class="mono">{user.slackId ?? '—'}</td>
+										<td class="mono">
+											{#if user.slackId}
+												<a class="slack-link" href={slackUserUrl(user.slackId)} target="_blank" rel="noopener noreferrer" onclick={(e) => e.stopPropagation()}>{user.slackId}</a>
+											{:else}
+												—
+											{/if}
+										</td>
 										<td>{user.hackatimeConnected ? 'Yes' : 'No'}</td>
 										<td>{formatDate(user.createdAt)}</td>
 									</tr>
@@ -880,7 +1243,13 @@
 										<dt>Name</dt><dd>{userDetail.name ?? '—'}</dd>
 										<dt>Email</dt><dd class="mono">{userDetail.email}</dd>
 										<dt>Nickname</dt><dd>{userDetail.nickname ?? '—'}</dd>
-										<dt>Slack ID</dt><dd class="mono">{userDetail.slackId ?? '—'}</dd>
+										<dt>Slack ID</dt><dd class="mono">
+											{#if userDetail.slackId}
+												<a class="slack-link" href={slackUserUrl(userDetail.slackId)} target="_blank" rel="noopener noreferrer">{userDetail.slackId}</a>
+											{:else}
+												—
+											{/if}
+										</dd>
 										<dt>Hackatime</dt><dd>{userDetail.hackatimeConnected ? 'Connected' : 'Not connected'}</dd>
 										<dt>Perms</dt><dd><span class="badge" class:banned={userDetail.perms === 'Banned'}>{userDetail.perms ?? 'Unknown'}</span></dd>
 										<dt>Active Sessions</dt><dd>{userDetail.activeSessions}</dd>
@@ -1038,6 +1407,54 @@
 						<span class="stat-value">{totalHackatime}</span>
 						<span class="stat-label">Hackatime Linked</span>
 					</div>
+					{#if isSuperAdmin}
+						<div class="stat-card" title="New Hackatime hours awaiting review across all unreviewed projects (excludes hours already approved on prior submissions). Cached for 60s.">
+							<span class="stat-value">
+								{#if unreviewedHours}
+									{unreviewedHours.totalHours.toFixed(1)}
+								{:else if unreviewedHoursLoading}
+									…
+								{:else}
+									—
+								{/if}
+							</span>
+							<span class="stat-label">
+								Unreviewed Hours
+								{#if unreviewedHours}
+									<span class="stat-sub"> ({unreviewedHours.projectCount} project{unreviewedHours.projectCount === 1 ? '' : 's'})</span>
+								{/if}
+							</span>
+						</div>
+						<div class="stat-card" title="Per-decision approval rate across all historical project_reviews. 'changes_needed' and 'ban' both count as not-approved.">
+							<span class="stat-value">
+								{#if unreviewedHours && unreviewedHours.decisionCount > 0}
+									{Math.round(unreviewedHours.approvalRate * 100)}%
+								{:else if unreviewedHoursLoading}
+									…
+								{:else}
+									—
+								{/if}
+							</span>
+							<span class="stat-label">
+								Approval Rate
+								{#if unreviewedHours && unreviewedHours.decisionCount > 0}
+									<span class="stat-sub"> ({unreviewedHours.decisionCount} decision{unreviewedHours.decisionCount === 1 ? '' : 's'})</span>
+								{/if}
+							</span>
+						</div>
+						<div class="stat-card" title="Unreviewed Hours × Approval Rate. Lower-bound estimate — ignores that 'changes_needed' projects often come back and get approved on a later pass.">
+							<span class="stat-value">
+								{#if unreviewedHours && unreviewedHours.decisionCount > 0}
+									{unreviewedHours.predictedApprovedHours.toFixed(1)}
+								{:else if unreviewedHoursLoading}
+									…
+								{:else}
+									—
+								{/if}
+							</span>
+							<span class="stat-label">Predicted Approved</span>
+						</div>
+					{/if}
 				</div>
 				<div class="stats-grid">
 					<DauChart />
@@ -1092,14 +1509,102 @@
 											<button class="btn btn-delete" onclick={() => deleteNews(item.id)} disabled={newsSaving}>Delete</button>
 										</td>
 									{/if}
-								</tr>
-							{/each}
-						</tbody>
-					</table>
-				{/if}
+							</tr>
+						{/each}
+					</tbody>
+				</table>
+			{/if}
+		</div>
+	{:else if activeTab === 'events'}
+		<div class="events-admin">
+			<div class="news-form event-form">
+				<h3>{editingEvent ? 'Edit Event' : 'Add Event'}</h3>
+				<div class="event-form-fields">
+					<input type="text" placeholder="Title" bind:value={newEventTitle} class="news-input event-title-input" />
+					<input type="url" placeholder="URL (optional)" bind:value={newEventUrl} class="news-input event-url-input" />
+					<select bind:value={newEventHostedBy} class="news-input event-hosted-input">
+						<option value="">{eventHostsLoading ? 'Loading users...' : 'Hosted by'}</option>
+						{#each eventHostUsers as user}
+							{#if user.slackId}
+								<option value={user.slackId}>{userDisplayName(user)} — {user.slackId}</option>
+							{/if}
+						{/each}
+					</select>
+					<textarea placeholder="Description" bind:value={newEventDescription} class="news-input news-input-text event-description-input" rows="3"></textarea>
+					<div class="news-date-row event-date-row">
+						<label for="event-start-at">Start</label>
+						<input id="event-start-at" type="datetime-local" bind:value={newEventStartAt} class="news-input news-input-date" />
+					</div>
+					<div class="news-date-row event-date-row">
+						<label for="event-end-at">End</label>
+						<input id="event-end-at" type="datetime-local" bind:value={newEventEndAt} class="news-input news-input-date" />
+					</div>
+					<div class="news-form-actions event-form-actions">
+						<button class="btn btn-add-news" onclick={editingEvent ? saveEventEdit : createEvent} disabled={eventSaving || !newEventTitle.trim() || !newEventHostedBy.trim() || !newEventStartAt.trim()}>
+							{eventSaving ? 'Saving...' : editingEvent ? 'Save Event' : 'Add Event'}
+						</button>
+						{#if editingEvent}
+							<button class="btn btn-cancel" onclick={resetEventForm} disabled={eventSaving}>Cancel</button>
+						{/if}
+					</div>
+				</div>
 			</div>
-		{:else if activeTab === 'fulfillment'}
+
+			{#if eventsLoading}
+				<p class="loading">Loading events...</p>
+			{:else if eventItems.length === 0}
+				<p class="empty">No events yet.</p>
+			{:else}
+				<table class="users-table">
+					<thead>
+						<tr>
+							<th>Start</th>
+							<th>Title</th>
+							<th>Hosted By</th>
+							<th>Actions</th>
+						</tr>
+					</thead>
+					<tbody>
+						{#each eventItems as evt}
+							<tr>
+								<td>{new Date(evt.startAt).toLocaleString()}</td>
+								<td>{evt.title}</td>
+								<td>
+									{#if evt.hostedBySlackId}
+										<a class="slack-link" href={slackUserUrl(evt.hostedBySlackId)} target="_blank" rel="noopener noreferrer">{evt.hostedByName ?? evt.hostedBySlackId}</a>
+									{:else if evt.hostedBy}
+										{evt.hostedByName ?? evt.hostedBy}
+									{:else}
+										—
+									{/if}
+								</td>
+									<td class="news-actions">
+									<button class="btn btn-edit" onclick={() => editEvent(evt)}>Edit</button>
+									<button class="btn btn-delete" onclick={() => deleteEvent(evt.id)} disabled={eventSaving}>Delete</button>
+								</td>
+							</tr>
+						{/each}
+					</tbody>
+				</table>
+			{/if}
+		</div>
+	{:else if activeTab === 'fulfillment'}
 			<div class="fulfillment-admin">
+				{#if hcbStatus}
+					<div class="hcb-banner" class:hcb-ok={hcbStatus.connected} class:hcb-warn={!hcbStatus.connected}>
+						{#if !hcbStatus.configured}
+							<span>⚠ HCB card grants are not configured on the server (set HCB_CLIENT_ID / HCB_ORG_ID).</span>
+						{:else if !hcbStatus.connected}
+							<span>HCB is not connected — card grants are disabled.</span>
+							<a class="btn btn-sm btn-primary" href="/api/admin/hcb/connect" data-sveltekit-reload>Connect HCB</a>
+						{:else}
+							<span>
+								✓ HCB connected{hcbStatus.orgId ? ` · org ${hcbStatus.orgId}` : ''}{hcbStatus.connectedByEmail ? ` · by ${hcbStatus.connectedByEmail}` : ''}
+							</span>
+							<a class="btn btn-sm" href="/api/admin/hcb/connect" data-sveltekit-reload>Reconnect</a>
+						{/if}
+					</div>
+				{/if}
 				<div class="fulfillment-toolbar">
 					<select bind:value={fulfillmentStatusFilter} class="users-perms-filter" onchange={() => loadFulfillment()}>
 						<option value="">All Statuses</option>
@@ -1137,18 +1642,36 @@
 						</thead>
 						<tbody>
 							{#each filteredFulfillment as order}
-								<tr class:fulfilled={order.status === 'fulfilled'}>
-									<td>{order.itemName}</td>
-									<td>{order.userName}{order.userSlackId ? ` (${order.userSlackId})` : ''}</td>
+								{@const detail = orderDetails[order.id]}
+								{@const isOpen = expandedOrderId === order.id}
+								<tr class:fulfilled={order.status === 'fulfilled'} class:order-row={true} class:order-row-open={isOpen} onclick={() => toggleOrderRow(order.id)} onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleOrderRow(order.id); } }} tabindex="0" role="button" aria-expanded={isOpen}>
+									<td><span class="order-row-toggle" aria-hidden="true">{isOpen ? '▾' : '▸'}</span> {order.itemName}</td>
+									<td>{order.userName}{order.userEmail ? ` (${order.userEmail})` : ''}</td>
 									<td>{order.quantity}</td>
 									<td>{order.pipesSpent}</td>
 									<td><span class="status-badge" class:status-pending={order.status === 'pending'} class:status-fulfilled={order.status === 'fulfilled'}>{order.status}</span></td>
 									<td>{order.pendingSince !== null ? formatPendingTime(order.pendingSince) : '—'}</td>
-									<td class="fulfillment-actions">
+									<td class="fulfillment-actions" onclick={(e) => e.stopPropagation()}>
 										{#if order.status === 'pending'}
 											<button class="btn btn-sm btn-primary" onclick={() => fulfillOrder(order.id)} disabled={fulfillmentActionLoading === order.id}>
 												{fulfillmentActionLoading === order.id ? '...' : 'Fulfill'}
 											</button>
+											{#if mergeableCounts[order.id]}
+												<button class="btn btn-sm btn-merge" onclick={() => mergeOrder(order)} disabled={fulfillmentActionLoading === order.id} title="Combine this order with the other pending orders the user placed for the same item">
+													{fulfillmentActionLoading === order.id ? '...' : `Merge (${mergeableCounts[order.id] + 1})`}
+												</button>
+											{/if}
+										{/if}
+										<button class="btn btn-sm btn-danger" onclick={() => refundOrder(order)} disabled={fulfillmentActionLoading === order.id}>
+											{fulfillmentActionLoading === order.id ? '...' : 'Refund'}
+										</button>
+										{#if hcbStatus?.connected}
+											<button
+												class="btn btn-sm btn-grant"
+												onclick={() => (grantModalOrder = order)}
+												disabled={!!order.hcbCardGrantId}
+												title={order.hcbCardGrantId ? `Grant already issued (${order.hcbCardGrantId})` : 'Issue an HCB card grant for this order'}
+											>{order.hcbCardGrantId ? 'Granted' : 'Card grant'}</button>
 										{/if}
 										<div class="fulfillment-msg-row">
 											<input
@@ -1166,6 +1689,80 @@
 										</div>
 									</td>
 								</tr>
+								{#if isOpen}
+									<tr class="order-detail-row">
+										<td colspan="7">
+											{#if detail === 'loading' || detail === undefined}
+												<div class="order-detail-loading">Loading order detail...</div>
+											{:else if detail === 'error'}
+												<div class="order-detail-error">Failed to load order detail. <button class="link-btn" onclick={() => toggleOrderRow(order.id)}>Retry</button></div>
+											{:else}
+												<div class="order-detail">
+													<div class="order-detail-section">
+														<h4 class="order-detail-heading">Shipping address <span class="order-detail-hint">(click any line to copy)</span></h4>
+														{#if detail.addressMissing || !detail.address}
+															<p class="order-detail-empty">No address on file in HCA. Ask the user to set one at auth.hackclub.com/portal/address.</p>
+														{:else}
+															<ul class="address-lines">
+																{#each [
+																	{ key: 'street', label: 'Street', value: detail.address.streetAddress },
+																	{ key: 'locality', label: 'City', value: detail.address.locality },
+																	{ key: 'region', label: 'Region', value: detail.address.region },
+																	{ key: 'postal', label: 'Postal code', value: detail.address.postalCode },
+																	{ key: 'country', label: 'Country', value: detail.address.country }
+																] as line (line.key)}
+																	{#if line.value}
+																		{@const ck = `${order.id}:${line.key}`}
+																		<li>
+																			<button type="button" class="address-line" class:copied={copiedKey === ck} onclick={() => copyAddressLine(ck, line.value)} title="Click to copy">
+																				<span class="address-label">{line.label}</span>
+																				<span class="address-value">{line.value}</span>
+																				<span class="address-copied">{copiedKey === ck ? 'copied!' : 'copy'}</span>
+																			</button>
+																		</li>
+																	{/if}
+																{/each}
+																{#if detail.address.streetAddress || detail.address.locality}
+																	{@const full = [
+																		detail.address.streetAddress,
+																		[detail.address.locality, detail.address.region].filter(Boolean).join(', '),
+																		detail.address.postalCode,
+																		detail.address.country
+																	].filter(Boolean).join('\n')}
+																	{@const ck = `${order.id}:full`}
+																	<li>
+																		<button type="button" class="address-line address-line-full" class:copied={copiedKey === ck} onclick={() => copyAddressLine(ck, full)} title="Copy full address">
+																			<span class="address-label">All</span>
+																			<span class="address-value">Copy full address</span>
+																			<span class="address-copied">{copiedKey === ck ? 'copied!' : 'copy'}</span>
+																		</button>
+																	</li>
+																{/if}
+															</ul>
+														{/if}
+													</div>
+													<div class="order-detail-section">
+														<h4 class="order-detail-heading">Approved projects ({detail.projects.length})</h4>
+														{#if detail.projects.length === 0}
+															<p class="order-detail-empty">No approved projects yet.</p>
+														{:else}
+															<ul class="approved-projects">
+																{#each detail.projects as p (p.id)}
+																	<li>
+																		<span class="approved-project-name">{p.name}</span>
+																		{#if p.projectType}<span class="approved-project-type">{p.projectType}</span>{/if}
+																		{#if p.hours != null}<span class="approved-project-hours">{p.hours}h</span>{/if}
+																		<span class="approved-project-date">{formatDate(p.approvedAt)}</span>
+																	</li>
+																{/each}
+															</ul>
+														{/if}
+													</div>
+												</div>
+											{/if}
+										</td>
+									</tr>
+								{/if}
 							{/each}
 						</tbody>
 					</table>
@@ -1198,6 +1795,10 @@
 							<label class="shop-checkbox">
 								<input type="checkbox" bind:checked={newShopActive} />
 								<span>Active (visible to users)</span>
+							</label>
+							<label class="shop-checkbox">
+								<input type="checkbox" bind:checked={newShopFeatured} />
+								<span>Featured (shown at the top)</span>
 							</label>
 							<button class="btn btn-add-shop" onclick={createShopItem} disabled={shopSaving || !newShopName.trim() || !newShopImage.trim() || !newShopPrice}>
 								{shopSaving ? 'Saving...' : 'Add Item'}
@@ -1251,6 +1852,10 @@
 												<input type="checkbox" bind:checked={editingShop.isActive} />
 												<span>Active</span>
 											</label>
+											<label class="shop-checkbox">
+												<input type="checkbox" bind:checked={editingShop.isFeatured} />
+												<span>Featured</span>
+											</label>
 											<div class="shop-edit-actions">
 												<button class="btn btn-save" onclick={saveShopEdit} disabled={shopSaving}>Save</button>
 												<button class="btn btn-cancel" onclick={() => editingShop = null}>Cancel</button>
@@ -1262,7 +1867,7 @@
 										<img src={item.imageUrl} alt={item.name} class="shop-item-thumb" />
 										<div class="shop-item-info">
 											<strong>{item.name}</strong>
-											<span class="shop-item-meta">{item.priceHours}h · {item.stock === null ? '∞' : item.stock} stock{item.estimatedShip ? ` · ${item.estimatedShip}` : ''}{!item.isActive ? ' · HIDDEN' : ''}</span>
+											<span class="shop-item-meta">{item.priceHours}h · {item.stock === null ? '∞' : item.stock} stock{item.estimatedShip ? ` · ${item.estimatedShip}` : ''}{item.isFeatured ? ' · FEATURED' : ''}{!item.isActive ? ' · HIDDEN' : ''}</span>
 										</div>
 									</div>
 									<div class="shop-item-actions">
@@ -1349,7 +1954,19 @@
 
 										<div class="proj-main-meta">
 											<span>Type: <strong>{selectedProject.projectType}</strong></span>
-											<span>User: <strong>{isSuperAdmin ? (selectedProject.user.name ?? '—') : (selectedProject.user.slackId ?? '—')}</strong>{isSuperAdmin && selectedProject.user.slackId ? ` (${selectedProject.user.slackId})` : ''}</span>
+											<span>
+												User:
+												<strong>{isSuperAdmin ? (selectedProject.user.name ?? '—') : ''}</strong>
+												{#if selectedProject.user.slackId}
+													{#if isSuperAdmin}
+														(<a class="slack-link" href={slackUserUrl(selectedProject.user.slackId)} target="_blank" rel="noopener noreferrer">{selectedProject.user.slackId}</a>)
+													{:else}
+														<strong><a class="slack-link" href={slackUserUrl(selectedProject.user.slackId)} target="_blank" rel="noopener noreferrer">{selectedProject.user.slackId}</a></strong>
+													{/if}
+												{:else if !isSuperAdmin}
+													<strong>—</strong>
+												{/if}
+											</span>
 											<span>Update: <strong>{selectedProject.isUpdate ? 'Yes' : 'No'}</strong></span>
 											<span>Created: <strong>{formatDate(selectedProject.createdAt)}</strong></span>
 										</div>
@@ -1426,21 +2043,32 @@
 									{/if}
 								{/if}
 
+								{#if selectedProject.latestSubmission?.reviewerNote}
+									<div class="proj-info-row">
+										<span class="proj-info-label">Note to Reviewer:</span>
+										<span class="proj-info-value" style="white-space: pre-wrap">{selectedProject.latestSubmission.reviewerNote}</span>
+									</div>
+								{/if}
+
+								<TimelapsePanel projectId={selectedProject.id} />
+
 								{#if selectedProject.status === 'unreviewed' || selectedProject.status === 'approved'}
 									<hr class="proj-divider" />
 
 									{#if hackatimeLoading}
 										<span class="ht-loading">Loading Hackatime data...</span>
 									{:else if hackatimeData}
+										{@const rawTrust = hackatimeData.trustLevel?.toLowerCase() ?? ''}
+										{@const displayTrust = !isSuperAdmin && rawTrust === 'yellow' ? 'blue' : rawTrust}
 										<div class="ht-detail">
 											<div class="ht-header">
-												<span class="ht-trust">Trust Level: <strong class="trust-{hackatimeData.trustLevel ?? 'unknown'}">{{ blue: 'standard', yellow: 'warned', red: 'banned' }[hackatimeData.trustLevel?.toLowerCase() ?? ''] ?? hackatimeData.trustLevel ?? 'unknown'}</strong></span>
+												<span class="ht-trust">Trust Level: <strong class="trust-{displayTrust || 'unknown'}">{{ blue: 'standard', yellow: 'warned', red: 'banned' }[displayTrust] ?? hackatimeData.trustLevel ?? 'unknown'}</strong></span>
 												<span class="ht-total">{hackatimeData.totalHours}h total</span>
 												{#if hackatimeData.earliestHeartbeat}
 													<span class="ht-earliest">first heartbeat: {new Date(hackatimeData.earliestHeartbeat * 1000).toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' })}</span>
 												{/if}
 												{#if hackatimeData.previousApprovedHours > 0}
-													<span class="ht-delta">prev: {hackatimeData.previousApprovedHours}h — delta: {Math.round((hackatimeData.totalHours - hackatimeData.previousApprovedHours) * 10) / 10}h</span>
+													<span class="ht-delta">prev approved: {hackatimeData.previousApprovedHours}h — new Hackatime since: {Math.round((hackatimeData.totalHours - hackatimeData.previousApprovedHours) * 10) / 10}h</span>
 												{/if}
 											</div>
 											{#if hackatimeData.linkedBanned || hackatimeData.emailMismatch || hackatimeData.trustLevel === 'red'}
@@ -1478,20 +2106,48 @@
 											{:else}
 												<span class="ht-empty">No linked Hackatime projects found</span>
 											{/if}
+											{#if hackatimeData.categories && hackatimeData.categories.length > 0}
+												{@const aiCat = hackatimeData.categories.find((c) => /ai/i.test(c.name))}
+												<div class="ht-categories">
+													<div class="ht-categories-header">
+														<span class="ht-categories-label">Category breakdown</span>
+														{#if aiCat}
+															<span class="ht-ai-pill" class:warn={aiCat.percent >= 30} class:flag={aiCat.percent >= 50}>
+																{aiCat.name}: {aiCat.percent}%
+															</span>
+														{/if}
+													</div>
+													<div class="ht-category-bars">
+														{#each hackatimeData.categories as cat}
+															<div class="ht-category" class:ai={/ai/i.test(cat.name)}>
+																<span class="ht-category-name">{cat.name}</span>
+																<div class="ht-category-bar"><div class="ht-category-fill" style:width="{cat.percent}%"></div></div>
+																<span class="ht-category-pct">{cat.percent}%</span>
+															</div>
+														{/each}
+													</div>
+												</div>
+											{/if}
 											{#if hackatimeData?.unifiedDuplicate}
 												<div class="unified-duplicate-alert">Duplicate Found — This code URL already exists in Unified Approved Projects</div>
 											{:else if hackatimeData?.unifiedError}
 												<div class="unified-error-alert">Unified check failed — could not verify code URL against Approved Projects</div>
 											{/if}
 											<label class="ht-justification-label">
-												Override Justification:
+												Override Justification: <span class="ht-justification-counter" class:ok={justificationOk}>{justificationOk ? 'ok' : `add ${justificationCharsRemaining} more chars`}</span>
 												<textarea class="ht-justification" bind:value={overrideJustification} rows="6"></textarea>
 											</label>
 										</div>
 									{/if}
 
+									{#if hackatimeData && (hackatimeData.previousApprovedHours > 0 || hackatimeData.previousInternalHours > 0)}
+										<div class="hours-reship-note">
+											<strong>Reship review:</strong> enter only the <em>new hours since the last approval</em> (delta). Defaults are the Hackatime delta. The submitted value is added on top of the previously approved hours, not replacing them.
+										</div>
+									{/if}
+
 									<div class="hours-adjust">
-										<span class="hours-adjust-label">Internal:</span>
+										<span class="hours-adjust-label">Internal{#if hackatimeData && hackatimeData.previousInternalHours > 0} (Δ){/if}:</span>
 										<button class="hours-btn" onclick={() => adjustHours(0.5)}>Halve</button>
 										<button class="hours-btn" onclick={() => adjustHours(1/3)}>Third</button>
 										<button class="hours-btn" onclick={() => adjustHours(0.25)}>Quarter</button>
@@ -1501,7 +2157,7 @@
 											<button class="hours-tick" onclick={() => { customHours = Math.round((customHours + 1) * 10) / 10; applyCustomHours(); }}>+</button>
 										</div>
 										<span class="hours-adjust-divider">|</span>
-										<span class="hours-adjust-label">User Facing:</span>
+										<span class="hours-adjust-label">User Facing{#if hackatimeData && hackatimeData.previousApprovedHours > 0} (Δ){/if}:</span>
 										<button class="hours-btn" onclick={() => { userFacingHours = Math.round(userFacingHours * 0.5 * 10) / 10; }}>Halve</button>
 										<button class="hours-btn" onclick={() => { userFacingHours = Math.round(userFacingHours * (1/3) * 10) / 10; }}>Third</button>
 										<button class="hours-btn" onclick={() => { userFacingHours = Math.round(userFacingHours * 0.25 * 10) / 10; }}>Quarter</button>
@@ -1529,9 +2185,35 @@
 									</div>
 
 									<div class="review-actions">
-										<button class="review-btn review-btn-approve" onclick={() => reviewProject('approved')} disabled={reviewSubmitting}>Approve</button>
+										<button class="review-btn review-btn-approve" onclick={() => reviewProject('approved')} disabled={reviewSubmitting || !justificationOk}>Approve</button>
 										<button class="review-btn review-btn-reject" onclick={() => reviewProject('changes_needed')} disabled={reviewSubmitting || !userFeedback.trim()}>Reject</button>
-										<button class="review-btn review-btn-ban" onclick={() => { if (confirm('Ban this user and reject their project?')) reviewProject('ban'); }} disabled={reviewSubmitting || !isSuperAdmin} title={!isSuperAdmin ? 'Ban is Super Admin only — flag in internal note and ping Euan' : ''}>Fail &amp; Ban</button>
+										<button class="review-btn review-btn-ban" onclick={() => { if (confirm('Ban this user and reject their project?')) reviewProject('ban'); }} disabled={reviewSubmitting || !canBan} title={!canBan ? 'Ban requires Super Admin or Fraud Reviewer — flag in internal note and ping Euan' : ''}>Fail &amp; Ban</button>
+									</div>
+								{/if}
+
+								{#if projectDevlogs.length > 0}
+									<hr class="proj-divider" />
+									<h4 class="reviews-heading">Devlogs ({projectDevlogs.length})</h4>
+									<div class="devlogs-list">
+										{#each projectDevlogs as dl}
+											<div class="devlog-card">
+												<div class="devlog-card-header">
+													<span class="devlog-card-author">{dl.userName ?? 'Unknown'}</span>
+													<span class="devlog-card-date">{formatDate(dl.createdAt)}</span>
+												</div>
+												{#if dl.title}<h5 class="devlog-card-title">{dl.title}</h5>{/if}
+												<p class="devlog-card-text">{dl.text}</p>
+												{#if dl.imageUrls && dl.imageUrls.length > 0}
+													<div class="devlog-card-images">
+														{#each dl.imageUrls as url}
+															<button type="button" class="devlog-card-image-btn" onclick={() => openDevlogLightbox(url)}>
+																<img src={url} alt="Devlog attachment" loading="lazy" />
+															</button>
+														{/each}
+													</div>
+												{/if}
+											</div>
+										{/each}
 									</div>
 								{/if}
 
@@ -1629,6 +2311,25 @@
 		{/if}
 	</main>
 </div>
+
+<svelte:window onkeydown={onDevlogLightboxKey} />
+
+{#if devlogLightbox}
+	<!-- svelte-ignore a11y_click_events_have_key_events -->
+	<!-- svelte-ignore a11y_no_static_element_interactions -->
+	<div class="devlog-lightbox" onclick={closeDevlogLightbox} role="dialog" aria-modal="true" aria-label="Devlog image">
+		<img src={devlogLightbox} alt="Devlog attachment full size" onclick={(e) => e.stopPropagation()} />
+		<button type="button" class="devlog-lightbox-close" onclick={closeDevlogLightbox} aria-label="Close">&times;</button>
+	</div>
+{/if}
+
+{#if grantModalOrder}
+	<CardGrantModal
+		order={grantModalOrder}
+		onClose={() => (grantModalOrder = null)}
+		onGranted={() => { grantModalOrder = null; onGrantIssued(); }}
+	/>
+{/if}
 
 <style>
 	.admin-shell {
@@ -1747,6 +2448,10 @@
 		margin-top: 0.25rem;
 	}
 
+	.stat-sub {
+		color: #666;
+	}
+
 	.users-toolbar {
 		display: flex;
 		gap: 0.5rem;
@@ -1835,6 +2540,15 @@
 	.users-table tbody tr.selected { background: #1e2a3a; }
 
 	.mono { font-family: 'SF Mono', 'Fira Code', monospace; font-size: 0.8rem; }
+
+	.slack-link {
+		color: #5b9bd5;
+		text-decoration: none;
+	}
+
+	.slack-link:hover {
+		text-decoration: underline;
+	}
 
 	.detail-panel {
 		flex: 0 0 50%;
@@ -2056,6 +2770,10 @@
 		max-width: 900px;
 	}
 
+	.events-admin {
+		max-width: 900px;
+	}
+
 	.news-form {
 		background: #222;
 		border: 1px solid #333;
@@ -2077,6 +2795,57 @@
 		grid-template-columns: auto 1fr auto;
 		gap: 0.5rem;
 		align-items: start;
+	}
+
+	.event-form-fields {
+		display: grid;
+		grid-template-columns: repeat(2, minmax(0, 1fr));
+		gap: 0.75rem;
+		align-items: start;
+	}
+
+	.event-description-input,
+	.event-form-actions {
+		grid-column: 1 / -1;
+	}
+
+	.event-date-row {
+		background: #1a1a1a;
+		border: 1px solid #444;
+		border-radius: 4px;
+		padding: 0.35rem 0.5rem;
+	}
+
+	.event-date-row label {
+		color: #888;
+		font-size: 0.75rem;
+		font-weight: 500;
+		text-transform: uppercase;
+		letter-spacing: 0.05em;
+		white-space: nowrap;
+	}
+
+	.event-date-row .news-input {
+		flex: 1;
+		min-width: 0;
+		border: 0;
+		background: transparent;
+		padding: 0.15rem 0;
+	}
+
+	.event-date-row .news-input:focus {
+		border-color: transparent;
+	}
+
+	.event-form-actions {
+		display: flex;
+		gap: 0.5rem;
+	}
+
+	@media (max-width: 760px) {
+		.event-form-fields {
+			grid-template-columns: 1fr;
+		}
 	}
 
 	.news-date-row {
@@ -2809,6 +3578,127 @@
 		margin-top: 0.35rem;
 	}
 
+	.devlogs-list {
+		display: flex;
+		flex-direction: column;
+		gap: 0.5rem;
+		margin-bottom: 0.5rem;
+	}
+
+	.devlog-card {
+		border: 1px solid #444;
+		border-left: 3px solid #93b4cd;
+		border-radius: 6px;
+		padding: 0.55rem 0.8rem;
+		background: #1e1e1e;
+	}
+
+	.devlog-card-header {
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+		margin-bottom: 0.3rem;
+		font-size: 0.75rem;
+	}
+
+	.devlog-card-author {
+		color: #ccc;
+		font-weight: 600;
+	}
+
+	.devlog-card-date {
+		color: #777;
+		margin-left: auto;
+	}
+
+	.devlog-card-title {
+		margin: 0 0 4px;
+		font-size: 0.95rem;
+		color: #e6f4fe;
+		font-weight: 600;
+		line-height: 1.3;
+	}
+
+	.devlog-card-text {
+		margin: 0;
+		font-size: 0.82rem;
+		color: #ddd;
+		white-space: pre-wrap;
+		line-height: 1.45;
+	}
+
+	.devlog-card-images {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.4rem;
+		margin-top: 0.5rem;
+	}
+
+	.devlog-card-image-btn {
+		padding: 0;
+		border: 0;
+		background: transparent;
+		cursor: zoom-in;
+		line-height: 0;
+	}
+
+	.devlog-card-images img {
+		width: 90px;
+		height: 90px;
+		object-fit: cover;
+		border-radius: 4px;
+		border: 1px solid #333;
+		display: block;
+		transition: transform 0.15s ease;
+	}
+
+	.devlog-card-image-btn:hover img {
+		transform: scale(1.04);
+	}
+
+	.devlog-lightbox {
+		position: fixed;
+		inset: 0;
+		z-index: 9999;
+		background: rgba(10, 10, 10, 0.9);
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		padding: 32px;
+		cursor: zoom-out;
+		backdrop-filter: blur(4px);
+	}
+
+	.devlog-lightbox img {
+		max-width: 100%;
+		max-height: 100%;
+		object-fit: contain;
+		border-radius: 4px;
+		box-shadow: 0 12px 40px rgba(0, 0, 0, 0.7);
+		cursor: default;
+	}
+
+	.devlog-lightbox-close {
+		position: absolute;
+		top: 18px;
+		right: 22px;
+		width: 40px;
+		height: 40px;
+		border-radius: 50%;
+		border: 0;
+		background: rgba(0, 0, 0, 0.6);
+		color: #fff;
+		font-size: 26px;
+		line-height: 38px;
+		text-align: center;
+		cursor: pointer;
+		padding: 0;
+	}
+
+	.devlog-lightbox-close:hover {
+		background: rgba(0, 0, 0, 0.85);
+	}
+
 	.review-card-internal .review-card-label {
 		color: #d4a55a;
 	}
@@ -2898,6 +3788,97 @@
 		font-style: italic;
 	}
 
+	.ht-categories {
+		margin-top: 0.6rem;
+		display: flex;
+		flex-direction: column;
+		gap: 0.4rem;
+	}
+
+	.ht-categories-header {
+		display: flex;
+		align-items: center;
+		gap: 0.6rem;
+	}
+
+	.ht-categories-label {
+		font-size: 0.8rem;
+		color: #aaa;
+		font-weight: 600;
+	}
+
+	.ht-ai-pill {
+		background: rgba(91, 155, 213, 0.15);
+		border: 1px solid #5b9bd5;
+		border-radius: 999px;
+		padding: 0.1rem 0.55rem;
+		font-size: 0.75rem;
+		color: #8ec0ec;
+		font-weight: 600;
+	}
+
+	.ht-ai-pill.warn {
+		background: rgba(220, 170, 50, 0.18);
+		border-color: #d4a64a;
+		color: #f0c46a;
+	}
+
+	.ht-ai-pill.flag {
+		background: rgba(220, 50, 50, 0.18);
+		border-color: #c44040;
+		color: #f44336;
+	}
+
+	.ht-category-bars {
+		display: flex;
+		flex-direction: column;
+		gap: 0.25rem;
+	}
+
+	.ht-category {
+		display: grid;
+		grid-template-columns: 9rem 1fr 3rem;
+		align-items: center;
+		gap: 0.5rem;
+		font-size: 0.75rem;
+		color: #ccc;
+	}
+
+	.ht-category-name {
+		color: #ccc;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+
+	.ht-category.ai .ht-category-name {
+		color: #8ec0ec;
+		font-weight: 600;
+	}
+
+	.ht-category-bar {
+		background: #1f1f1f;
+		border: 1px solid #444;
+		border-radius: 3px;
+		height: 0.55rem;
+		overflow: hidden;
+	}
+
+	.ht-category-fill {
+		height: 100%;
+		background: #5b9bd5;
+	}
+
+	.ht-category.ai .ht-category-fill {
+		background: #8ec0ec;
+	}
+
+	.ht-category-pct {
+		text-align: right;
+		color: #aaa;
+		font-variant-numeric: tabular-nums;
+	}
+
 	.unified-duplicate-alert {
 		background: rgba(220, 50, 50, 0.15);
 		border: 2px solid #c44040;
@@ -2974,6 +3955,31 @@
 	.ht-justification:focus {
 		outline: none;
 		border-color: #5b9bd5;
+	}
+
+	.ht-justification-counter {
+		display: inline-block;
+		margin-left: 0.5rem;
+		padding: 0.1rem 0.5rem;
+		font-size: 0.75rem;
+		font-weight: 700;
+		border-radius: 4px;
+		background: rgba(212, 90, 90, 0.18);
+		color: #e08080;
+	}
+	.ht-justification-counter.ok {
+		background: rgba(90, 180, 110, 0.18);
+		color: #6fc285;
+	}
+
+	.hours-reship-note {
+		background: rgba(60, 130, 200, 0.12);
+		border: 1px solid #3b7bb5;
+		border-radius: 6px;
+		color: #b8d4ee;
+		padding: 0.5rem 0.75rem;
+		font-size: 0.8rem;
+		margin: 0.5rem 0;
 	}
 
 	/* ── Shop Admin ── */
@@ -3312,6 +4318,8 @@
 	.admin-shell.light .news-edit-input { background: #f5f4f1; border-color: #555; color: #1a1a1a; }
 	.admin-shell.light .news-input:focus,
 	.admin-shell.light .news-edit-input:focus { border-color: #3b7bb5; }
+	.admin-shell.light .event-date-row { background: #f5f4f1; border-color: #555; }
+	.admin-shell.light .event-date-row label { color: #555; }
 
 	.admin-shell.light .btn-now { background: #e8e6e1; color: #333; border-color: #555; }
 	.admin-shell.light .btn-now:hover:not(:disabled) { background: #ddd; }
@@ -3430,6 +4438,7 @@
 	.admin-shell.light .ht-btn-docs { background: #f5f4f1; color: #1a1a1a; border-color: #555; }
 
 	.admin-shell.light .mono { color: #1a1a1a; }
+	.admin-shell.light .slack-link { color: #2a6699; }
 
 	/* ── Fulfillment ─────────────────────────────────── */
 	.fulfillment-admin { padding: 0; }
@@ -3515,6 +4524,45 @@
 	}
 	.btn-primary:hover { background: rgba(147, 180, 205, 0.5); }
 
+	.btn-danger {
+		background: rgba(196, 131, 130, 0.25);
+		border-color: #c48382;
+		color: #f4d6d5;
+	}
+	.btn-danger:hover:not(:disabled) { background: rgba(196, 131, 130, 0.45); }
+	.admin-shell.light .btn-danger { background: #f5d5d5; color: #c02020; border-color: #aa5050; }
+	.admin-shell.light .btn-danger:hover:not(:disabled) { background: #f0c0c0; }
+
+	.btn-merge {
+		background: rgba(205, 180, 120, 0.22);
+		border-color: #cdb478;
+		color: #f4ead0;
+	}
+	.btn-merge:hover:not(:disabled) { background: rgba(205, 180, 120, 0.4); }
+	.admin-shell.light .btn-merge { background: #f5ecc8; color: #8a6a1f; border-color: #b89a4a; }
+	.admin-shell.light .btn-merge:hover:not(:disabled) { background: #f0e0a8; }
+
+	.btn-grant {
+		background: rgba(108, 217, 104, 0.18);
+		border-color: #6bd968;
+		color: #d6f5d4;
+	}
+	.btn-grant:hover:not(:disabled) { background: rgba(108, 217, 104, 0.34); }
+
+	.hcb-banner {
+		display: flex;
+		align-items: center;
+		gap: 0.75rem;
+		flex-wrap: wrap;
+		padding: 0.6rem 0.85rem;
+		border-radius: 6px;
+		margin-bottom: 0.85rem;
+		font-size: 0.85rem;
+		border: 1px solid transparent;
+	}
+	.hcb-banner.hcb-ok { background: rgba(108, 217, 104, 0.12); border-color: rgba(108, 217, 104, 0.4); }
+	.hcb-banner.hcb-warn { background: rgba(236, 55, 80, 0.12); border-color: rgba(236, 55, 80, 0.4); }
+
 	/* light mode overrides */
 	.admin-shell.light .admin-table th { color: #333; }
 	.admin-shell.light .admin-table td { border-color: #ddd; }
@@ -3522,4 +4570,83 @@
 	.admin-shell.light .fulfillment-msg-input { background: #fff; border-color: #ccc; color: #1a1a1a; }
 	.admin-shell.light .status-pending { background: rgba(196, 131, 130, 0.15); }
 	.admin-shell.light .status-fulfilled { background: rgba(147, 180, 205, 0.15); }
+
+	.order-row { cursor: pointer; }
+	.order-row-toggle { display: inline-block; width: 1em; color: #93b4cd; }
+	.order-row-open { background: rgba(147, 180, 205, 0.06); }
+
+	.order-detail-row td {
+		padding: 1rem 1.25rem;
+		background: rgba(0,0,0,0.18);
+		border-top: 1px dashed rgba(255,255,255,0.08);
+	}
+	.admin-shell.light .order-detail-row td { background: rgba(0,0,0,0.03); border-top-color: rgba(0,0,0,0.08); }
+
+	.order-detail {
+		display: grid;
+		grid-template-columns: minmax(260px, 1fr) minmax(260px, 1.4fr);
+		gap: 1.5rem;
+	}
+	.order-detail-section { min-width: 0; }
+	.order-detail-heading {
+		margin: 0 0 0.5rem;
+		font-size: 0.85rem;
+		text-transform: uppercase;
+		letter-spacing: 0.05em;
+		color: #93b4cd;
+	}
+	.order-detail-hint { font-weight: 400; text-transform: none; letter-spacing: 0; color: rgba(255,255,255,0.5); font-size: 0.75rem; margin-left: 0.4rem; }
+	.admin-shell.light .order-detail-hint { color: rgba(0,0,0,0.5); }
+	.order-detail-empty { color: rgba(255,255,255,0.6); font-size: 0.85rem; margin: 0; }
+	.admin-shell.light .order-detail-empty { color: rgba(0,0,0,0.55); }
+	.order-detail-loading { color: rgba(255,255,255,0.6); font-size: 0.85rem; }
+	.order-detail-error { color: #c48382; font-size: 0.85rem; }
+
+	.address-lines { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 0.25rem; }
+	.address-line {
+		display: grid;
+		grid-template-columns: 90px 1fr auto;
+		gap: 0.5rem;
+		align-items: center;
+		width: 100%;
+		padding: 0.4rem 0.6rem;
+		background: rgba(0,0,0,0.25);
+		border: 1px solid rgba(255,255,255,0.08);
+		border-radius: 4px;
+		cursor: pointer;
+		color: inherit;
+		font: inherit;
+		text-align: left;
+		transition: background 120ms ease, border-color 120ms ease;
+	}
+	.address-line:hover { background: rgba(147, 180, 205, 0.12); border-color: rgba(147, 180, 205, 0.4); }
+	.address-line.copied { background: rgba(120, 180, 130, 0.18); border-color: rgba(120, 180, 130, 0.6); }
+	.address-line-full { font-style: italic; }
+	.address-label { font-size: 0.75rem; text-transform: uppercase; color: rgba(255,255,255,0.55); letter-spacing: 0.04em; }
+	.admin-shell.light .address-label { color: rgba(0,0,0,0.55); }
+	.address-value { font-family: ui-monospace, "Courier New", monospace; font-size: 0.9rem; word-break: break-word; }
+	.address-copied { font-size: 0.7rem; color: rgba(255,255,255,0.55); text-transform: uppercase; letter-spacing: 0.05em; }
+	.admin-shell.light .address-line { background: #fff; border-color: #ddd; }
+	.admin-shell.light .address-line:hover { background: #eef4fa; border-color: #93b4cd; }
+	.admin-shell.light .address-copied { color: rgba(0,0,0,0.5); }
+
+	.approved-projects { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 0.25rem; }
+	.approved-projects li {
+		display: flex;
+		gap: 0.6rem;
+		align-items: baseline;
+		padding: 0.35rem 0.55rem;
+		background: rgba(0,0,0,0.18);
+		border-radius: 4px;
+		font-size: 0.85rem;
+	}
+	.admin-shell.light .approved-projects li { background: rgba(0,0,0,0.03); }
+	.approved-project-name { font-weight: 600; }
+	.approved-project-type { color: rgba(255,255,255,0.55); font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.04em; }
+	.admin-shell.light .approved-project-type { color: rgba(0,0,0,0.55); }
+	.approved-project-hours { color: #93b4cd; font-variant-numeric: tabular-nums; }
+	.approved-project-date { margin-left: auto; color: rgba(255,255,255,0.5); font-size: 0.75rem; }
+	.admin-shell.light .approved-project-date { color: rgba(0,0,0,0.55); }
+
+	.link-btn { background: none; border: none; color: #93b4cd; cursor: pointer; padding: 0; font: inherit; text-decoration: underline; }
 </style>

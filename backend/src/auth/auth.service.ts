@@ -105,6 +105,13 @@ export class AuthService {
     code: string,
     returnedSignedState: string,
     cookieState: string,
+    attribution?: {
+      utm_source?: string | null;
+      utm_medium?: string | null;
+      utm_campaign?: string | null;
+      referrer?: string | null;
+      landing_path?: string | null;
+    },
   ): Promise<{ token: string; refreshToken: string; redirectTo: string }> {
     // 1. Verify state
     const dotIndex = returnedSignedState.lastIndexOf('.');
@@ -173,7 +180,12 @@ export class AuthService {
     }
 
     // 4. Upsert user in DB (pass HCA tokens so they're persisted encrypted)
-    const user = await this.upsertUser(userinfo, tokens.access_token, tokens.refresh_token);
+    const user = await this.upsertUser(
+      userinfo,
+      tokens.access_token,
+      tokens.refresh_token,
+      attribution,
+    );
 
     // 4b. Check if user is banned
     try {
@@ -353,10 +365,43 @@ export class AuthService {
     return { token };
   }
 
+  /** Whether the one-time home "hackathon or shop?" prompt still needs answering. */
+  async getIntentStatus(userId: string): Promise<{ needsPrompt: boolean }> {
+    const user = await this.userRepo.findOne({
+      where: { id: userId },
+      select: ['id', 'intent'],
+    });
+    return { needsPrompt: !!user && !user.intent };
+  }
+
+  /**
+   * Records the user's home-prompt answer. Writes Airtable FIRST — only on
+   * success do we set the local flag, so a transient Airtable failure leaves
+   * the prompt showing (it keeps showing until answered) rather than silently
+   * dropping the response.
+   */
+  async setIntent(userId: string, intent: string): Promise<{ success: true }> {
+    const user = await this.userRepo.findOne({ where: { id: userId } });
+    if (!user) throw new Error('User not found');
+
+    await this.rsvpService.setIntent(user.email, intent);
+
+    user.intent = intent;
+    await this.userRepo.save(user);
+    return { success: true };
+  }
+
   private async upsertUser(
     userinfo: Record<string, any>,
     hcaAccessToken?: string,
     hcaRefreshToken?: string,
+    attribution?: {
+      utm_source?: string | null;
+      utm_medium?: string | null;
+      utm_campaign?: string | null;
+      referrer?: string | null;
+      landing_path?: string | null;
+    },
   ): Promise<User> {
     const hasAddress = !!(
       userinfo.address ||
@@ -365,6 +410,11 @@ export class AuthService {
     const hasBirthdate = !!(
       userinfo.birthdate && userinfo.birthdate.trim() !== ''
     );
+
+    const trim = (v: string | null | undefined): string | undefined =>
+      typeof v === 'string' && v.trim() !== ''
+        ? v.trim().slice(0, 255)
+        : undefined;
 
     let user = await this.userRepo.findOne({
       where: { hcaSub: userinfo.sub },
@@ -395,6 +445,11 @@ export class AuthService {
         hasBirthdate,
         hcaAccessToken: hcaAccessToken ?? undefined,
         hcaRefreshToken: hcaRefreshToken ?? undefined,
+        utmSource: trim(attribution?.utm_source),
+        utmMedium: trim(attribution?.utm_medium),
+        utmCampaign: trim(attribution?.utm_campaign),
+        referrer: trim(attribution?.referrer),
+        landingPath: trim(attribution?.landing_path),
       });
       return await this.userRepo.save(user);
     } catch (err: any) {

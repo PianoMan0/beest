@@ -2,11 +2,15 @@ import {
   Controller,
   Get,
   Post,
+  Delete,
   Body,
+  Param,
+  ParseUUIDPipe,
   Req,
   UseGuards,
   BadRequestException,
 } from '@nestjs/common';
+import { Throttle } from '@nestjs/throttler';
 import type { Request } from 'express';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { ShopService } from './shop.service';
@@ -56,6 +60,20 @@ export class ShopController {
   }
 
   @UseGuards(JwtAuthGuard)
+  @Post('orders/:id/refund')
+  async refundOwnOrder(
+    @Req() req: Request,
+    @Param('id', ParseUUIDPipe) id: string,
+  ) {
+    const userId = (req as any).user?.uid;
+    if (!userId) throw new BadRequestException('Not authenticated');
+    return this.shopService.refundOrder(id, {
+      requireUserId: userId,
+      requirePending: true,
+    });
+  }
+
+  @UseGuards(JwtAuthGuard)
   @Get('fulfillment')
   async getFulfillmentUpdates(@Req() req: Request) {
     const userId = (req as any).user?.uid;
@@ -79,5 +97,47 @@ export class ShopController {
     if (!userId) throw new BadRequestException('Not authenticated');
     const count = await this.shopService.getUnreadCount(userId);
     return { count };
+  }
+
+  // ── Shop suggestions ──
+
+  @UseGuards(JwtAuthGuard)
+  @Get('suggestions')
+  async listSuggestions(@Req() req: Request) {
+    const userId = (req as any).user?.uid;
+    if (!userId) throw new BadRequestException('Not authenticated');
+    return this.shopService.listSuggestions(userId);
+  }
+
+  @Throttle({ default: { limit: 10, ttl: 60000 } })
+  @UseGuards(JwtAuthGuard)
+  @Post('suggestions')
+  async createSuggestion(
+    @Req() req: Request,
+    @Body() body: { text?: string },
+  ) {
+    const userId = (req as any).user?.uid;
+    if (!userId) throw new BadRequestException('Not authenticated');
+    if (!body?.text || typeof body.text !== 'string') {
+      throw new BadRequestException('text is required');
+    }
+    return this.shopService.createSuggestion(userId, body.text);
+  }
+
+  @Throttle({ default: { limit: 60, ttl: 60000 } })
+  @UseGuards(JwtAuthGuard)
+  @Post('suggestions/:id/vote')
+  async voteSuggestion(@Req() req: Request, @Param('id') id: string) {
+    const userId = (req as any).user?.uid;
+    if (!userId) throw new BadRequestException('Not authenticated');
+    return this.shopService.toggleSuggestionVote(userId, id);
+  }
+
+  @UseGuards(JwtAuthGuard)
+  @Delete('suggestions/:id')
+  async deleteSuggestion(@Req() req: Request, @Param('id') id: string) {
+    const userId = (req as any).user?.uid;
+    if (!userId) throw new BadRequestException('Not authenticated');
+    return this.shopService.deleteSuggestion(userId, id);
   }
 }

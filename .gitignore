@@ -25,3 +25,11 @@ Thumbs.db
 .claude/
 CLAUDE.md
 .mcp.json
+
+# Dev-server stdout captures
+*-dev.log
+*.log
+
+# One-off / local scripts
+/scripts/
+backend/scripts/

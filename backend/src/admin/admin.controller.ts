@@ -7,25 +7,32 @@ import {
   Param,
   Body,
   Req,
+  Res,
   UseGuards,
   BadRequestException,
   ParseUUIDPipe,
 } from '@nestjs/common';
-import type { Request } from 'express';
+import type { Request, Response } from 'express';
+import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { SuperAdminGuard } from './super-admin.guard';
 import { ReviewerGuard } from './reviewer.guard';
+import { FraudReviewerGuard } from './fraud-reviewer.guard';
 import { AdminService } from './admin.service';
+import { AuditService, type AuditAction } from './audit.service';
 import { AuditLogService } from '../audit-log/audit-log.service';
 import { AuthService } from '../auth/auth.service';
 import { ShopService } from '../shop/shop.service';
+import { DevlogsService } from '../devlogs/devlogs.service';
 
 @Controller('api/admin')
 export class AdminController {
   constructor(
     private readonly adminService: AdminService,
+    private readonly auditService: AuditService,
     private readonly auditLogService: AuditLogService,
     private readonly authService: AuthService,
     private readonly shopService: ShopService,
+    private readonly devlogsService: DevlogsService,
   ) {}
 
   @UseGuards(SuperAdminGuard)
@@ -125,10 +132,67 @@ export class AdminController {
     return this.adminService.getSignupsHistory();
   }
 
+  @UseGuards(JwtAuthGuard)
+  @Get('events/upcoming')
+  listUpcomingEvents() {
+    return this.adminService.listUpcomingEvents();
+  }
+
+  @UseGuards(SuperAdminGuard)
+  @Get('events')
+  listEvents() {
+    return this.adminService.listEvents();
+  }
+
+  @UseGuards(SuperAdminGuard)
+  @Post('events')
+  createEvent(
+    @Body()
+    body: {
+      title?: string;
+      description?: string | null;
+      hostedBy?: string | null;
+      startAt?: string;
+      endAt?: string | null;
+      url?: string | null;
+    },
+  ) {
+    return this.adminService.createEvent(body);
+  }
+
+  @UseGuards(SuperAdminGuard)
+  @Patch('events/:id')
+  updateEvent(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body()
+    body: {
+      title?: string;
+      description?: string | null;
+      hostedBy?: string | null;
+      startAt?: string;
+      endAt?: string | null;
+      url?: string | null;
+    },
+  ) {
+    return this.adminService.updateEvent(id, body);
+  }
+
+  @UseGuards(SuperAdminGuard)
+  @Delete('events/:id')
+  deleteEvent(@Param('id', ParseUUIDPipe) id: string) {
+    return this.adminService.deleteEvent(id);
+  }
+
   @UseGuards(SuperAdminGuard)
   @Get('stats/funnel')
   getUserFunnel() {
     return this.adminService.getUserFunnel();
+  }
+
+  @UseGuards(SuperAdminGuard)
+  @Get('stats/unreviewed-hours')
+  getUnreviewedHours() {
+    return this.adminService.getUnreviewedHours();
   }
 
   // ── Projects ──
@@ -172,9 +236,10 @@ export class AdminController {
     const reviewer = (req as any).user;
     const reviewerId = reviewer?.uid;
     const isSuperAdmin = reviewer?.perms === 'Super Admin';
+    const canBan = isSuperAdmin || reviewer?.perms === 'Fraud Reviewer';
 
-    if (body.status === 'ban' && !isSuperAdmin) {
-      throw new BadRequestException('Only Super Admins can ban users. Flag this project in your internal note and ping Euan.');
+    if (body.status === 'ban' && !canBan) {
+      throw new BadRequestException('Only Super Admins and Fraud Reviewers can ban users. Flag this project in your internal note and ping Euan.');
     }
 
     const HOURS_CAP = 500;
@@ -185,6 +250,20 @@ export class AdminController {
       if (value === undefined || value === null) continue;
       if (!Number.isFinite(value) || value < 0 || value > HOURS_CAP) {
         throw new BadRequestException(`${field} must be a finite number between 0 and ${HOURS_CAP}`);
+      }
+    }
+
+    // Reviewer must add their own reasoning beyond the auto-generated template
+    // (~180 chars) — require at least 250 chars on overrideJustification for an
+    // approve action so approvals aren't rubber-stamped. Rejections don't need
+    // a long justification (the feedback field carries the user-facing reason).
+    if (body.status === 'approved') {
+      const justification = (body.overrideJustification ?? '').trim();
+      const JUSTIFICATION_MIN = 250;
+      if (justification.length < JUSTIFICATION_MIN) {
+        throw new BadRequestException(
+          `Override Justification must be at least ${JUSTIFICATION_MIN} characters — please add at least 70 characters of your own reasoning beyond the auto-generated template.`,
+        );
       }
     }
 
@@ -216,6 +295,13 @@ export class AdminController {
     return this.adminService.getProjectReviews(id, true);
   }
 
+  /** Devlog entries authored by the project owner and linked to this project. */
+  @UseGuards(ReviewerGuard)
+  @Get('projects/:id/devlogs')
+  getProjectDevlogs(@Param('id', ParseUUIDPipe) id: string) {
+    return this.devlogsService.findByProject(id);
+  }
+
   @UseGuards(ReviewerGuard)
   @Get('review-leaderboard')
   getReviewLeaderboard(@Req() req: Request) {
@@ -226,6 +312,88 @@ export class AdminController {
       throw new BadRequestException(`window must be one of: ${validWindows.join(', ')}`);
     }
     return this.adminService.getReviewLeaderboard(win as '24h' | '7d' | '30d' | 'all');
+  }
+
+  // ── Admin audit queue ──
+  // Projects parked in 'fraud_pending' after first-reviewer approval are queued
+  // here for a second-pass audit before pipes are paid out and the project syncs
+  // to Airtable. Open to Super Admin and Fraud Reviewer.
+
+  @UseGuards(FraudReviewerGuard)
+  @Get('audit/queue')
+  auditQueue() {
+    return this.auditService.listQueue();
+  }
+
+  // Super-admin-only escape hatch: when the audit queue is empty, pull up to
+  // 10 oldest unreviewed projects in as one-shot reviews (skips first-pass).
+  @UseGuards(SuperAdminGuard)
+  @Post('audit/load-unreviewed')
+  async auditLoadUnreviewed(@Req() req: Request) {
+    const superAdminId = (req as any).user?.uid;
+    return this.auditService.loadUnreviewedIntoQueue(superAdminId);
+  }
+
+  @UseGuards(FraudReviewerGuard)
+  @Post('audit/:id/decision')
+  async auditDecision(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body()
+    body: {
+      action?: string;
+      overrideHours?: number | null;
+      internalHours?: number | null;
+      justification?: string | null;
+      reviewerFeedback?: string | null;
+      userFeedback?: string | null;
+    },
+    @Req() req: Request,
+  ) {
+    const validActions = ['approve', 'rereview', 'reject', 'ban'];
+    if (!body.action || !validActions.includes(body.action)) {
+      throw new BadRequestException(
+        `action must be one of: ${validActions.join(', ')}`,
+      );
+    }
+    const reviewer = (req as any).user;
+    const auditorId = reviewer?.uid;
+    const isSuperAdmin = reviewer?.perms === 'Super Admin';
+    if (body.action === 'ban' && !isSuperAdmin) {
+      throw new BadRequestException(
+        'Only Super Admins can ban from the audit panel.',
+      );
+    }
+    return this.auditService.decide(id, auditorId, {
+      action: body.action as AuditAction,
+      overrideHours: body.overrideHours ?? null,
+      internalHours: body.internalHours ?? null,
+      justification: body.justification ?? null,
+      reviewerFeedback: body.reviewerFeedback ?? null,
+      userFeedback: body.userFeedback ?? null,
+      isSuperAdmin,
+    });
+  }
+
+  @UseGuards(FraudReviewerGuard)
+  @Get('audit/:id/activity')
+  async auditActivity(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Res() res: Response,
+  ) {
+    res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('X-Accel-Buffering', 'no');
+    try {
+      for await (const evt of this.auditService.streamActivityEvents(id)) {
+        res.write(JSON.stringify(evt) + '\n');
+        // flush eagerly so the client sees per-day progress
+        (res as any).flush?.();
+      }
+    } catch {
+      res.write(JSON.stringify({ type: 'error', error: 'stream-failed' }) + '\n');
+    } finally {
+      res.end();
+    }
   }
 
   @UseGuards(SuperAdminGuard)
@@ -290,6 +458,7 @@ export class AdminController {
     stock?: number | null;
     estimatedShip?: string | null;
     isActive?: boolean;
+    isFeatured?: boolean;
   }) {
     if (!body.name || !body.description || !body.imageUrl || body.priceHours == null) {
       throw new BadRequestException('name, description, imageUrl, and priceHours are required');
@@ -311,6 +480,7 @@ export class AdminController {
       stock: body.stock,
       estimatedShip: body.estimatedShip,
       isActive: body.isActive,
+      isFeatured: body.isFeatured,
     });
   }
 
@@ -342,6 +512,7 @@ export class AdminController {
       stock?: number | null;
       estimatedShip?: string | null;
       isActive?: boolean;
+      isFeatured?: boolean;
     },
   ) {
     if (body.priceHours !== undefined) {
@@ -378,9 +549,35 @@ export class AdminController {
   }
 
   @UseGuards(SuperAdminGuard)
+  @Get('orders/:id/detail')
+  async getOrderDetail(@Param('id', ParseUUIDPipe) id: string) {
+    return this.adminService.getOrderDetailForFulfillment(id);
+  }
+
+  @UseGuards(SuperAdminGuard)
   @Post('orders/:id/fulfill')
   async fulfillOrder(@Param('id', ParseUUIDPipe) id: string) {
     return this.shopService.fulfillOrder(id);
+  }
+
+  @UseGuards(SuperAdminGuard)
+  @Post('orders/:id/refund')
+  async refundOrder(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Req() req: Request,
+  ) {
+    const adminId = (req as any).user?.uid;
+    return this.shopService.refundOrder(id, { adminId });
+  }
+
+  @UseGuards(SuperAdminGuard)
+  @Post('orders/:id/merge')
+  async mergeOrder(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Req() req: Request,
+  ) {
+    const adminId = (req as any).user?.uid;
+    return this.shopService.mergeOrders(id, adminId);
   }
 
   @UseGuards(SuperAdminGuard)

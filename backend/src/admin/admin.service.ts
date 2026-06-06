@@ -6,7 +6,7 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { In, Repository } from 'typeorm';
 import { User } from '../entities/user.entity';
 import { Session } from '../entities/session.entity';
 import { Project } from '../entities/project.entity';
@@ -16,10 +16,13 @@ import { ProjectReview } from '../entities/project-review.entity';
 import { ShopItem } from '../entities/shop-item.entity';
 import { Order } from '../entities/order.entity';
 import { Submission } from '../entities/submission.entity';
+import { Event } from '../entities/event.entity';
 import { RsvpService } from '../rsvp/rsvp.service';
 import { AuditLogService } from '../audit-log/audit-log.service';
 import { HcaService } from '../hca/hca.service';
 import { fetchWithTimeout } from '../fetch.util';
+import { ProjectAirtableSyncService } from '../projects/project-airtable-sync.service';
+import { SlackService } from '../slack/slack.service';
 
 const VALID_PERMS = [
   'User',
@@ -35,12 +38,25 @@ export class AdminService {
   private readonly logger = new Logger(AdminService.name);
   private readonly hackatimeBaseUrl: string;
   private readonly hackatimeAdminKey: string | undefined;
-  private readonly unifiedApiKey: string | undefined;
-  private readonly unifiedBaseId = 'app3A5kJwYqxMLOgh';
 
   // DAU cache (5-minute TTL)
   private dauCache: { count: number; timestamp: number } | null = null;
   private readonly DAU_CACHE_TTL = 5 * 60 * 1000;
+
+  // Unreviewed-hours cache (60-second TTL) — each refresh fans out to one
+  // Hackatime /spans request per (unreviewed project × linked HT name), so
+  // back-to-back stats-page loads must not multiply that fan-out.
+  private unreviewedHoursCache: {
+    payload: {
+      totalHours: number;
+      projectCount: number;
+      approvalRate: number;
+      decisionCount: number;
+      predictedApprovedHours: number;
+    };
+    timestamp: number;
+  } | null = null;
+  private readonly UNREVIEWED_HOURS_CACHE_TTL = 60 * 1000;
 
   // Signups history cache (10-minute TTL) — Airtable call is moderately expensive
   private signupsCache: {
@@ -55,6 +71,10 @@ export class AdminService {
   private readonly dauHistoryCache = new Map<string, number>();
   private dauHistoryInflight: Promise<void> | null = null;
   private static readonly DAU_HISTORY_START = '2026-04-03';
+  // Beest event start. Hackatime hours logged before this date should not
+  // count toward project review totals (admin /user/projects returns lifetime
+  // total_duration with no date filter, so we reconstruct from spans).
+  private static readonly HACKATIME_EVENT_START = '2026-04-02';
 
   constructor(
     private readonly configService: ConfigService,
@@ -67,9 +87,12 @@ export class AdminService {
     @InjectRepository(ShopItem) private readonly shopRepo: Repository<ShopItem>,
     @InjectRepository(Order) private readonly orderRepo: Repository<Order>,
     @InjectRepository(Submission) private readonly submissionRepo: Repository<Submission>,
+    @InjectRepository(Event) private readonly eventRepo: Repository<Event>,
     private readonly rsvpService: RsvpService,
     private readonly auditLogService: AuditLogService,
     private readonly hcaService: HcaService,
+    private readonly airtableSync: ProjectAirtableSyncService,
+    private readonly slackService: SlackService,
   ) {
     this.hackatimeBaseUrl = this.configService.get(
       'HACKATIME_BASE_URL',
@@ -79,7 +102,6 @@ export class AdminService {
     if (!this.hackatimeAdminKey) {
       this.logger.warn('HACKATIME_ADMIN_API_KEY not set — admin Hackatime lookups disabled');
     }
-    this.unifiedApiKey = this.configService.get('UNIFIED_API_KEY');
   }
 
   async listUsers(): Promise<any[]> {
@@ -154,6 +176,177 @@ export class AdminService {
       activeSessions: sessions,
       auditLogs,
     };
+  }
+
+  private async withEventHosts(events: Event[]): Promise<Array<Event & { hostedByName: string | null; hostedBySlackId: string | null }>> {
+    const hostValues = Array.from(
+      new Set(events.map((event) => event.hostedBy?.trim()).filter((hostedBy): hostedBy is string => !!hostedBy)),
+    );
+    if (hostValues.length === 0) {
+      return events.map((event) => ({ ...event, hostedByName: null, hostedBySlackId: null }));
+    }
+
+    const hosts = await this.userRepo.find({
+      where: [
+        { slackId: In(hostValues) },
+        { nickname: In(hostValues) },
+        { name: In(hostValues) },
+      ],
+      select: ['hcaSub', 'slackId', 'name', 'nickname', 'email'],
+    });
+    const slackDisplayNames = new Map<string, string | null>();
+    await Promise.all(
+      hosts
+        .filter((host) => !!host.slackId)
+        .map(async (host) => {
+          slackDisplayNames.set(host.slackId, await this.slackService.getUserDisplayName(host.slackId));
+        }),
+    );
+    const hcaNicknames = new Map<string, string | null>();
+    await Promise.all(
+      hosts
+        .filter((host) => !!host.slackId && !slackDisplayNames.get(host.slackId) && !host.nickname)
+        .map(async (host) => {
+          const identity = await this.hcaService.getIdentity(host.hcaSub);
+          const nickname = typeof identity?.nickname === 'string' && identity.nickname.trim() ? identity.nickname.trim() : null;
+          hcaNicknames.set(host.slackId, nickname);
+        }),
+    );
+
+    const hostLookup = new Map<string, { name: string; slackId: string | null }>();
+    for (const host of hosts) {
+      const displayName = host.slackId
+        ? slackDisplayNames.get(host.slackId) || host.nickname || hcaNicknames.get(host.slackId) || host.slackId
+        : host.nickname || host.name || host.email;
+      for (const key of [host.slackId, host.nickname, host.name]) {
+        if (key && !hostLookup.has(key)) {
+          hostLookup.set(key, { name: displayName, slackId: host.slackId ?? null });
+        }
+      }
+    }
+
+    return events.map((event) => ({
+      ...event,
+      hostedByName: event.hostedBy ? (hostLookup.get(event.hostedBy)?.name ?? event.hostedBy) : null,
+      hostedBySlackId: event.hostedBy ? (hostLookup.get(event.hostedBy)?.slackId ?? null) : null,
+    }));
+  }
+
+  async listEvents() {
+    const events = await this.eventRepo.find({ order: { startAt: 'ASC', title: 'ASC' } });
+    return this.withEventHosts(events);
+  }
+
+  async listUpcomingEvents() {
+    const now = new Date();
+    const events = await this.eventRepo
+      .createQueryBuilder('event')
+      .where('event.end_at IS NULL OR event.end_at >= :now', { now: now.toISOString() })
+      .orderBy('event.start_at', 'ASC')
+      .getMany();
+    return this.withEventHosts(events);
+  }
+
+  async createEvent(body: {
+    title?: string;
+    description?: string | null;
+    hostedBy?: string | null;
+    startAt?: string;
+    endAt?: string | null;
+    url?: string | null;
+  }) {
+    const title = (body.title ?? '').trim();
+    const hostedBy = (body.hostedBy ?? '').trim();
+    const startAt = body.startAt ? new Date(body.startAt) : null;
+    const endAt = body.endAt ? new Date(body.endAt) : null;
+
+    if (!title) {
+      throw new BadRequestException('title is required');
+    }
+    if (!hostedBy) {
+      throw new BadRequestException('hostedBy is required');
+    }
+    if (!startAt || Number.isNaN(startAt.getTime())) {
+      throw new BadRequestException('startAt is required and must be a valid datetime');
+    }
+    if (endAt && Number.isNaN(endAt.getTime())) {
+      throw new BadRequestException('endAt must be a valid datetime');
+    }
+    if (endAt && endAt < startAt) {
+      throw new BadRequestException('endAt must be the same or after startAt');
+    }
+
+    const event = this.eventRepo.create({
+      title,
+      description: body.description?.trim() || null,
+      hostedBy,
+      startAt,
+      endAt: endAt || null,
+      url: body.url?.trim() || null,
+    });
+    const saved = await this.eventRepo.save(event);
+    const [eventWithHost] = await this.withEventHosts([saved]);
+    return eventWithHost;
+  }
+
+  async updateEvent(id: string, body: {
+    title?: string;
+    description?: string | null;
+    hostedBy?: string | null;
+    startAt?: string;
+    endAt?: string | null;
+    url?: string | null;
+  }) {
+    const event = await this.eventRepo.findOne({ where: { id } });
+    if (!event) {
+      throw new NotFoundException('Event not found');
+    }
+
+    if (body.title !== undefined) {
+      event.title = body.title.trim() || event.title;
+    }
+    if (body.description !== undefined) {
+      event.description = body.description?.trim() || null;
+    }
+    if (body.hostedBy !== undefined) {
+      const hostedBy = body.hostedBy?.trim() || '';
+      if (!hostedBy) {
+        throw new BadRequestException('hostedBy is required');
+      }
+      event.hostedBy = hostedBy;
+    }
+    if (body.url !== undefined) {
+      event.url = body.url?.trim() || null;
+    }
+    if (body.startAt !== undefined) {
+      const startAt = new Date(body.startAt);
+      if (Number.isNaN(startAt.getTime())) {
+        throw new BadRequestException('startAt must be a valid datetime');
+      }
+      event.startAt = startAt;
+    }
+    if (body.endAt !== undefined) {
+      const endAt = body.endAt ? new Date(body.endAt) : null;
+      if (body.endAt && Number.isNaN(endAt?.getTime())) {
+        throw new BadRequestException('endAt must be a valid datetime');
+      }
+      event.endAt = endAt;
+    }
+    if (event.endAt && event.endAt < event.startAt) {
+      throw new BadRequestException('endAt must be the same or after startAt');
+    }
+
+    const saved = await this.eventRepo.save(event);
+    const [eventWithHost] = await this.withEventHosts([saved]);
+    return eventWithHost;
+  }
+
+  async deleteEvent(id: string) {
+    const result = await this.eventRepo.delete({ id });
+    if (result.affected === 0) {
+      throw new NotFoundException('Event not found');
+    }
+    return { success: true };
   }
 
   async banUser(userId: string, adminId?: string): Promise<void> {
@@ -287,6 +480,7 @@ export class AdminService {
     const statusCounts = {
       unshipped: 0,
       unreviewed: 0,
+      fraud_pending: 0,
       changes_needed: 0,
       approved: 0,
     };
@@ -333,6 +527,7 @@ export class AdminService {
             id: latestSub.id,
             changeDescription: latestSub.changeDescription,
             minHoursConfirmed: latestSub.minHoursConfirmed,
+            reviewerNote: latestSub.reviewerNote,
             status: latestSub.status,
             createdAt: latestSub.createdAt,
           } : null,
@@ -361,58 +556,158 @@ export class AdminService {
       throw new BadRequestException('You cannot review your own project');
     }
 
+    const previousStatus = project.status;
+    const previousOverrideHours = project.overrideHours;
+
+    // Block re-reviewing an already-approved project. Reviewers must send to
+    // "changes needed" first (which claws back pipes and zeroes hours) before
+    // re-approving. This prevents:
+    //   - duplicate Airtable rows on accidental double-approve clicks
+    //   - inflate-on-re-approve where a reviewer raises overrideHours on a
+    //     project that's already paid out, granting extra pipes
+    if (previousStatus === 'approved' && status === 'approved') {
+      throw new BadRequestException(
+        'Project is already approved. Send to "changes needed" first if you need to re-review.',
+      );
+    }
+    // Block re-approving while still waiting on the fraud-review verdict.
+    if (previousStatus === 'fraud_pending' && status === 'approved') {
+      throw new BadRequestException(
+        'Project is already awaiting fraud review. Wait for the verdict before re-reviewing.',
+      );
+    }
+
     // Find the latest unreviewed submission for this project
     const submission = await this.submissionRepo.findOne({
       where: { projectId, status: 'unreviewed' },
       order: { createdAt: 'DESC' },
     });
 
-    // 1. Update project status and hours
-    project.status = status;
-    if (overrideHours !== null && overrideHours !== undefined) {
-      project.overrideHours = Math.round(overrideHours * 10) / 10;
-    }
-    if (internalHours !== null && internalHours !== undefined) {
-      project.internalHours = Math.round(internalHours * 10) / 10;
-    }
-    await this.projectRepo.save(project);
-
-    // 2a. Claw back pipes if revoking a previously-approved project
-    if (status === 'changes_needed' && (project.pipesGranted ?? 0) > 0) {
-      const clawback = project.pipesGranted!;
-      await this.userRepo.decrement({ id: project.userId }, 'pipes', clawback);
-      project.pipesGranted = 0;
-      await this.projectRepo.save(project);
-      this.logger.warn(`Clawed back ${clawback} pipes from user ${project.userId} for project ${project.id}`);
-    }
-
-    // 2b. Grant pipes as delta on this submission
-    //    Pipes granted = overrideHours for THIS submission minus what was already granted on previous submissions.
-    //    The project's pipesGranted tracks the cumulative total.
-    if (status === 'approved' && project.overrideHours != null && project.overrideHours > 0) {
-      const totalPipesTarget = Math.floor(project.overrideHours);
-      const previouslyGranted = project.pipesGranted ?? 0;
-      const delta = totalPipesTarget - previouslyGranted;
-      if (delta > 0) {
-        await this.userRepo.increment({ id: project.userId }, 'pipes', delta);
-        project.pipesGranted = totalPipesTarget;
-        await this.projectRepo.save(project);
-
-        // Track what this submission granted
-        if (submission) {
-          submission.pipesGranted = delta;
-        }
+    // 1. Update project status and hours.
+    //
+    // On approval, the reviewer's submitted overrideHours/internalHours are the
+    // DELTA for THIS submission — new work since the last approval — and are
+    // ADDED on top of the project's existing approved hours, never overwriting.
+    // For initial ships project.overrideHours is 0, so the delta becomes the
+    // cumulative; for reships the delta accumulates on top of prior approvals.
+    // After approved → changes_needed (which wipes hours/claws back pipes), the
+    // project is back at 0, so a follow-up approval starts fresh from the delta.
+    //
+    // When the reviewer approves, the project does NOT go straight to 'approved'.
+    // It moves to 'fraud_pending' first — the joe.fraud first-pass review must
+    // clear before pipes are granted and the project syncs to Airtable. The
+    // background poller in FraudReviewService observes the verdict and either
+    // finalises the approval or marks the project changes_needed with a
+    // generic user-facing message.
+    project.status = status === 'approved' ? 'fraud_pending' : status;
+    if (status === 'approved') {
+      if (overrideHours !== null && overrideHours !== undefined) {
+        const delta = Math.round(overrideHours * 10) / 10;
+        project.overrideHours = Math.round(((project.overrideHours ?? 0) + delta) * 10) / 10;
+      }
+      if (internalHours !== null && internalHours !== undefined) {
+        const internalDelta = Math.round(internalHours * 10) / 10;
+        project.internalHours = Math.round(((project.internalHours ?? 0) + internalDelta) * 10) / 10;
       }
     }
 
-    // 3. Update the submission status and hours
+    // Hackatime cap: reviewer cannot approve more new hours than the user has
+    // actually logged in Hackatime since the last approval (with a 0.5h buffer
+    // for rounding). This refetches Hackatime server-side at approval time so a
+    // tampered request body can't bypass it.
+    if (
+      status === 'approved' &&
+      overrideHours !== null &&
+      overrideHours !== undefined &&
+      overrideHours > 0
+    ) {
+      try {
+        const ht = await this.getProjectHackatime(projectId, false);
+        const currentHackatime = ht?.totalHours ?? 0;
+        const previousProjectHours = previousOverrideHours ?? 0;
+        const allowedDelta = currentHackatime - previousProjectHours + 0.5;
+        const submittedDelta = Math.round(overrideHours * 10) / 10;
+        if (submittedDelta > allowedDelta) {
+          const hackatimeDelta = Math.round((currentHackatime - previousProjectHours) * 10) / 10;
+          throw new BadRequestException(
+            `Cannot approve ${submittedDelta}h of new work — Hackatime shows only ${hackatimeDelta}h of new time since last approval. Reduce the approved hours, or send to "changes needed" if the hours look wrong.`,
+          );
+        }
+      } catch (e) {
+        if (e instanceof BadRequestException) throw e;
+        // Hackatime fetch failed for an unrelated reason — log and proceed,
+        // rather than blocking reviews on Hackatime outages.
+        this.logger.warn(`Hackatime cap check failed for project ${projectId}: ${e}`);
+      }
+    }
+
+    // project.overrideHours is the CUMULATIVE total approved hours for this
+    // project (sum of submission deltas across all approved ships). Validate:
+    //   - status=approved + finalHours <= 0 silently zeroes pipes_granted and,
+    //     because the bar suppresses overflow on approved projects, makes the
+    //     user's hours appear to vanish (moaz, 2026-05-05).
+    //   - status=approved + finalHours < pipes_granted desyncs the bar from the
+    //     pipes already paid out (sadrita, 2026-04-29).
+    // To genuinely reduce a project's hours, route through changes_needed first
+    // (which claws back pipes), then re-approve.
+    if (status === 'approved') {
+      const finalHours = project.overrideHours ?? 0;
+      if (finalHours <= 0) {
+        throw new BadRequestException(
+          'Cannot approve a project at 0 hours. Enter a positive delta of new hours, or use "changes needed" to reject without granting pipes.',
+        );
+      }
+      if (finalHours < (project.pipesGranted ?? 0)) {
+        throw new BadRequestException(
+          `Cannot reduce approved hours to ${finalHours} — ${project.pipesGranted} pipes have already been granted on this project. Send to "changes needed" first to claw back pipes.`,
+        );
+      }
+    }
+
+    await this.projectRepo.save(project);
+
+    // 2a. Handle rejection.
+    // - Direct approved → changes_needed: wipe overrideHours and claw back pipes (the approval is being revoked).
+    // - unreviewed → changes_needed with prior approval (pipesGranted > 0): preserve the prior approval's
+    //   hours and pipes — only the new resubmission is being rejected, the original approval still stands.
+    // - Any other path into changes_needed (never approved): clear overrideHours so a reviewer-set value
+    //   on the rejection doesn't bleed into the approved bucket on the next resubmission.
+    if (status === 'changes_needed') {
+      if (previousStatus === 'approved') {
+        project.overrideHours = 0;
+        if ((project.pipesGranted ?? 0) > 0) {
+          const clawback = project.pipesGranted!;
+          await this.userRepo.decrement({ id: project.userId }, 'pipes', clawback);
+          project.pipesGranted = 0;
+          this.logger.warn(`Clawed back ${clawback} pipes from user ${project.userId} for project ${project.id}`);
+        }
+        await this.projectRepo.save(project);
+      } else if (previousStatus === 'unreviewed' && (project.pipesGranted ?? 0) > 0) {
+        project.overrideHours = previousOverrideHours;
+        await this.projectRepo.save(project);
+      } else {
+        project.overrideHours = 0;
+        await this.projectRepo.save(project);
+      }
+    }
+
+    // 2b. Pipe granting on the approved path is DEFERRED to the fraud-review
+    //     poller (FraudReviewService.completeApproval). Clawback on the
+    //     changes_needed path was already handled in section 2a above.
+
+    // 3. Update the submission status and hours.
+    //    On the approved path the submission stays at 'unreviewed' until the
+    //    fraud poller flips it to 'approved' (or to 'changes_needed' on
+    //    fraud-rejection). Only update here for the non-approved paths.
     if (submission) {
-      submission.status = status;
       if (overrideHours !== null && overrideHours !== undefined) {
         submission.overrideHours = Math.round(overrideHours * 10) / 10;
       }
       if (internalHours !== null && internalHours !== undefined) {
         submission.internalHours = Math.round(internalHours * 10) / 10;
+      }
+      if (status !== 'approved') {
+        submission.status = status;
       }
       await this.submissionRepo.save(submission);
     }
@@ -432,71 +727,11 @@ export class AdminService {
     // 5. Audit log to the project owner (not the reviewer)
     const label =
       status === 'approved'
-        ? `Project "${project.name}" was approved`
+        ? `Project "${project.name}" was approved by reviewer`
         : `Project "${project.name}" received feedback`;
     await this.auditLogService.log(project.userId, 'project_reviewed', label);
 
-    // 6. Sync approval date to Airtable for Loops
-    if (status === 'approved' && project.user?.email) {
-      this.rsvpService.updateDateField(project.user.email, 'Loops - beestApprovedProject');
-    }
-
-    // 7. Push the approved project + HCA address/birthday to the Airtable Projects table
-    if (status === 'approved' && project.user?.email) {
-      this.syncApprovedProjectToAirtable(project, review).catch((err) => {
-        this.logger.error(`Airtable Projects sync failed for ${project.id}: ${err}`);
-      });
-    }
-
     return { success: true };
-  }
-
-  private async syncApprovedProjectToAirtable(
-    project: Project,
-    review: ProjectReview,
-  ): Promise<void> {
-    const identity = await this.hcaService.getIdentity(project.user.hcaSub);
-    const address = identity?.address ?? {};
-    const streetLines = (address.street_address ?? '').split(/\r?\n/);
-
-    const fullName = identity?.name ?? '';
-    const [splitFirst, ...splitRest] = fullName.split(' ');
-    const firstName = (identity as any)?.given_name ?? splitFirst;
-    const lastName = (identity as any)?.family_name ?? splitRest.join(' ');
-
-    const screenshots = [project.screenshot1Url, project.screenshot2Url]
-      .filter((url): url is string => !!url)
-      .map((url) => ({ url }));
-
-    const fields: Record<string, any> = {
-      'First Name': firstName,
-      'Last Name': lastName,
-      'Description': project.description,
-      'Email': project.user.email,
-      'Playable URL': project.demoUrl,
-      'Code URL': project.codeUrl,
-      'Screenshot': screenshots,
-      'Address (Line 1)': streetLines[0],
-      'Address (Line 2)': streetLines.slice(1).join(', '),
-      'City': address.locality,
-      'State / Province': address.region,
-      'Country': address.country,
-      'ZIP / Postal Code': address.postal_code,
-      'Birthday': identity?.birthdate,
-      'Override Hours Spent': project.internalHours,
-      'Override Hours Spent Justification': review.overrideJustification,
-    };
-
-    // Drop empty/null/undefined so Airtable doesn't reject the record
-    const cleanFields = Object.fromEntries(
-      Object.entries(fields).filter(([, v]) => {
-        if (v === null || v === undefined || v === '') return false;
-        if (Array.isArray(v) && v.length === 0) return false;
-        return true;
-      }),
-    );
-
-    await this.rsvpService.createApprovedProjectRecord(cleanFields);
   }
 
   async resyncProjectToAirtable(projectId: string, reviewerId: string) {
@@ -509,9 +744,14 @@ export class AdminService {
       throw new BadRequestException('Only approved projects can be re-pushed to Airtable');
     }
 
-    // Find the latest review for this project to include override justification
+    // Find the latest review and latest approved submission for this project to
+    // include override justification and per-ship internal hours
     const latestReview = await this.reviewRepo.findOne({
       where: { projectId },
+      order: { createdAt: 'DESC' },
+    });
+    const latestApprovedSub = await this.submissionRepo.findOne({
+      where: { projectId, status: 'approved' },
       order: { createdAt: 'DESC' },
     });
 
@@ -522,9 +762,10 @@ export class AdminService {
 
     // Re-push the full project record to Airtable Projects table
     try {
-      await this.syncApprovedProjectToAirtable(
+      await this.airtableSync.syncApprovedProject(
         project,
-        latestReview ?? ({} as ProjectReview),
+        latestReview?.overrideJustification ?? null,
+        latestApprovedSub ?? null,
       );
     } catch (err) {
       this.logger.error(`Airtable resync failed for project ${projectId}: ${err}`);
@@ -618,7 +859,7 @@ export class AdminService {
   private async checkUnifiedDuplicate(
     codeUrl: string,
   ): Promise<{ duplicate: boolean; error: boolean }> {
-    if (!this.unifiedApiKey || !codeUrl) {
+    if (!codeUrl) {
       return { duplicate: false, error: true };
     }
 
@@ -638,22 +879,21 @@ export class AdminService {
 
     try {
       const params = new URLSearchParams({
-        filterByFormula: formula,
-        maxRecords: '1',
-        'fields[]': 'Code URL',
+        select: JSON.stringify({
+          filterByFormula: formula,
+          maxRecords: 1,
+          fields: ['Code URL'],
+        }),
       });
-      const url = `https://api.airtable.com/v0/${this.unifiedBaseId}/Approved%20Projects?${params}`;
+      const url = `https://api2.hackclub.com/v0.1/Unified%20YSWS%20Projects%20DB/Approved%20Projects?${params.toString()}`;
       this.logger.log(`Unified check: formula=${formula}`);
-      const res = await fetchWithTimeout(url, {
-        headers: { Authorization: `Bearer ${this.unifiedApiKey}` },
-      });
+      const res = await fetchWithTimeout(url);
       if (!res.ok) {
         const body = await res.text();
         this.logger.warn(`Unified check failed (${res.status}): ${body}`);
         return { duplicate: false, error: true };
       }
-      const data = await res.json();
-      const records: any[] = data?.records ?? [];
+      const records: any[] = await res.json() ?? [];
       this.logger.log(`Unified check: ${records.length} records found`);
       // Only expose match/no-match — never leak record contents
       return { duplicate: records.length > 0, error: false };
@@ -664,13 +904,20 @@ export class AdminService {
 
   // ── Hackatime admin lookup ──
 
-  private emptyHackatimeResult(projectId: string, user: User | null, isSuperAdmin: boolean) {
+  private emptyHackatimeResult(
+    projectId: string,
+    user: User | null,
+    isSuperAdmin: boolean,
+    project?: Project | null,
+  ) {
     return {
       projectId,
       hackatimeProjects: [],
+      categories: [],
       totalHours: 0,
       earliestHeartbeat: null,
-      previousApprovedHours: 0,
+      previousApprovedHours: project?.overrideHours ?? 0,
+      previousInternalHours: project?.internalHours ?? 0,
       trustLevel: null,
       linkedBanned: false,
       linkedEmail: null,
@@ -714,7 +961,7 @@ export class AdminService {
     const hackatimeNames: string[] = project.hackatimeProjectName ?? [];
     const user = project.user;
     if (!user) {
-      return this.emptyHackatimeResult(projectId, user, isSuperAdmin);
+      return this.emptyHackatimeResult(projectId, user, isSuperAdmin, project);
     }
 
     try {
@@ -756,7 +1003,7 @@ export class AdminService {
         }
       }
       if (!hackatimeUserId) {
-        return this.emptyHackatimeResult(projectId, user, isSuperAdmin);
+        return this.emptyHackatimeResult(projectId, user, isSuperAdmin, project);
       }
 
       // 2. Get user info (trust level), projects, and Unified duplicate check in parallel
@@ -799,6 +1046,7 @@ export class AdminService {
       }
 
       let matched: { name: string; hours: number; languages: string[]; firstHeartbeat: number | null }[] = [];
+      let categories: { name: string; totalSeconds: number; percent: number }[] = [];
       if (projectsRes.ok) {
         const projData = await projectsRes.json();
         const allProjects: {
@@ -813,24 +1061,112 @@ export class AdminService {
 
         if (hackatimeNames.length > 0) {
           const nameSet = new Set(hackatimeNames);
-          matched = allProjects
-            .filter((p) => nameSet.has(p.name))
-            .map((p) => {
-              const fhRaw = p.first_heartbeat ?? null;
-              let firstHeartbeat: number | null = null;
-              if (fhRaw !== null && fhRaw !== undefined) {
-                const n = typeof fhRaw === 'string' ? Number(fhRaw) : fhRaw;
-                if (Number.isFinite(n) && n > 0) {
-                  firstHeartbeat = n > 1e12 ? Math.floor(n / 1000) : Math.floor(n);
+          const matchedRaw = allProjects.filter((p) => nameSet.has(p.name));
+
+          // Fetch event-window hours from spans per project: the admin
+          // /user/projects total_duration is lifetime, which would surface
+          // pre-event hours to reviewers. end_date is padded by one day so
+          // today's spans are fully included even with timezone edges.
+          const endDatePadded = AdminService.ymdUtc(
+            new Date(Date.now() + 86400_000),
+          );
+          const spansResults = await Promise.allSettled(
+            matchedRaw.map((p) =>
+              this.hackatimeGet(
+                `/api/v1/users/${encodeURIComponent(String(hackatimeUserId))}/heartbeats/spans` +
+                  `?start_date=${AdminService.HACKATIME_EVENT_START}&end_date=${endDatePadded}` +
+                  `&project=${encodeURIComponent(p.name)}`,
+              ).then(async (r) =>
+                r.ok
+                  ? ((await r.json()) as {
+                      spans?: { start_time?: number; end_time?: number; duration?: number }[];
+                    })
+                  : null,
+              ),
+            ),
+          );
+
+          // Pull the Wakatime-compatible categories summary so reviewers can see
+          // how much of the time was "AI Coding" vs regular coding. One stats
+          // call covers all linked projects via filter_by_project.
+          try {
+            const statsRes = await this.hackatimeGet(
+              `/api/v1/users/${encodeURIComponent(String(hackatimeUserId))}/stats` +
+                `?start_date=${AdminService.HACKATIME_EVENT_START}&end_date=${endDatePadded}` +
+                `&filter_by_project=${encodeURIComponent(matchedRaw.map((p) => p.name).join(','))}`,
+            );
+            if (statsRes.ok) {
+              const statsBody = await statsRes.json();
+              const rawCats = statsBody?.data?.categories ?? statsBody?.categories ?? [];
+              if (Array.isArray(rawCats)) {
+                const parsed = rawCats
+                  .map((c: { name?: unknown; total_seconds?: unknown }) => {
+                    const secs = typeof c?.total_seconds === 'number' ? c.total_seconds : Number(c?.total_seconds);
+                    return {
+                      name: typeof c?.name === 'string' ? c.name : '',
+                      totalSeconds: Number.isFinite(secs) && secs > 0 ? secs : 0,
+                    };
+                  })
+                  .filter((c) => c.name && c.totalSeconds > 0);
+                const sum = parsed.reduce((s, c) => s + c.totalSeconds, 0);
+                if (sum > 0) {
+                  categories = parsed
+                    .map((c) => ({
+                      name: c.name,
+                      totalSeconds: c.totalSeconds,
+                      percent: Math.round((c.totalSeconds / sum) * 1000) / 10,
+                    }))
+                    .sort((a, b) => b.percent - a.percent);
                 }
               }
-              return {
-                name: p.name,
-                hours: Math.round(((p.total_duration ?? (p as any).total_seconds ?? 0) / 3600) * 10) / 10,
-                languages: p.languages ?? [],
-                firstHeartbeat,
-              };
-            });
+            }
+          } catch (err) {
+            this.logger.warn(`Hackatime category stats failed for project ${projectId}: ${err}`);
+          }
+
+          matched = matchedRaw.map((p, i) => {
+            const fhRaw = p.first_heartbeat ?? null;
+            let firstHeartbeat: number | null = null;
+            if (fhRaw !== null && fhRaw !== undefined) {
+              const n = typeof fhRaw === 'string' ? Number(fhRaw) : fhRaw;
+              if (Number.isFinite(n) && n > 0) {
+                firstHeartbeat = n > 1e12 ? Math.floor(n / 1000) : Math.floor(n);
+              }
+            }
+
+            let seconds = 0;
+            const sr = spansResults[i];
+            if (sr.status === 'fulfilled' && sr.value?.spans) {
+              for (const span of sr.value.spans) {
+                if (
+                  typeof span.duration === 'number' &&
+                  Number.isFinite(span.duration) &&
+                  span.duration > 0
+                ) {
+                  seconds += span.duration;
+                  continue;
+                }
+                if (
+                  typeof span.start_time === 'number' &&
+                  typeof span.end_time === 'number' &&
+                  Number.isFinite(span.start_time) &&
+                  Number.isFinite(span.end_time) &&
+                  span.end_time > span.start_time
+                ) {
+                  // start/end may arrive as seconds or milliseconds.
+                  const diff = span.end_time - span.start_time;
+                  seconds += diff > 1e9 ? diff / 1000 : diff;
+                }
+              }
+            }
+
+            return {
+              name: p.name,
+              hours: Math.round((seconds / 3600) * 10) / 10,
+              languages: p.languages ?? [],
+              firstHeartbeat,
+            };
+          });
         }
       }
 
@@ -843,20 +1179,21 @@ export class AdminService {
         .filter((t): t is number => t !== null);
       const earliestHeartbeat = heartbeatTimes.length > 0 ? Math.min(...heartbeatTimes) : null;
 
-      // Calculate previous approved hours for delta display on resubmissions
-      const lastApprovedSub = await this.submissionRepo.findOne({
-        where: { projectId, status: 'approved' },
-        order: { createdAt: 'DESC' },
-        select: ['id', 'overrideHours'],
-      });
-      const previousApprovedHours = lastApprovedSub?.overrideHours ?? 0;
+      // Currently-applied approved hours on the project (the additive base for
+      // delta-mode review UI). When a project was approved → changes_needed,
+      // these are 0 even if a historical approved submission exists, signaling
+      // the FE to switch the input back to cumulative-mode for the next review.
+      const previousApprovedHours = project.overrideHours ?? 0;
+      const previousInternalHours = project.internalHours ?? 0;
 
       return {
         projectId,
         hackatimeProjects: matched,
+        categories,
         totalHours,
         earliestHeartbeat,
         previousApprovedHours,
+        previousInternalHours,
         trustLevel,
         linkedBanned,
         linkedEmail: isSuperAdmin ? linkedEmail : null,
@@ -873,9 +1210,11 @@ export class AdminService {
       return {
         projectId,
         hackatimeProjects: [],
+        categories: [],
         totalHours: 0,
         earliestHeartbeat: null,
-        previousApprovedHours: 0,
+        previousApprovedHours: project.overrideHours ?? 0,
+        previousInternalHours: project.internalHours ?? 0,
         trustLevel: null,
         linkedBanned: false,
         linkedEmail: null,
@@ -887,6 +1226,156 @@ export class AdminService {
         unifiedError: true,
       };
     }
+  }
+
+  // ── Unreviewed hours ──
+
+  /**
+   * Sum of new Hackatime hours awaiting review across every project currently
+   * in 'unreviewed' status, plus the historical per-decision approval rate and
+   * a naive prediction of how many of those pending hours will end up approved.
+   *
+   * - Hours: for resubmissions the project's previously-approved `overrideHours`
+   *   is subtracted, and event-window /spans are used (not lifetime totals) so
+   *   pre-event Hackatime time is excluded — matches the per-project review UI.
+   * - Approval rate: across every entry in project_reviews, treats both
+   *   'changes_needed' and 'ban' as not-approved.
+   * - Predicted approved hours: totalHours * approvalRate. This is intentionally
+   *   simple — it ignores the fact that 'changes_needed' projects often come
+   *   back and get approved on a later pass, so it's a lower-bound estimate.
+   */
+  async getUnreviewedHours(): Promise<{
+    totalHours: number;
+    projectCount: number;
+    approvalRate: number;
+    decisionCount: number;
+    predictedApprovedHours: number;
+  }> {
+    if (
+      this.unreviewedHoursCache &&
+      Date.now() - this.unreviewedHoursCache.timestamp < this.UNREVIEWED_HOURS_CACHE_TTL
+    ) {
+      return this.unreviewedHoursCache.payload;
+    }
+
+    // Historical approval rate from project_reviews. Cheap query — single scan
+    // over a small table — so it shares the unreviewed-hours cache TTL.
+    const reviewCounts = await this.reviewRepo
+      .createQueryBuilder('r')
+      .select("COUNT(*) FILTER (WHERE r.status = 'approved')::int", 'approved')
+      .addSelect("COUNT(*) FILTER (WHERE r.status = 'changes_needed')::int", 'changesNeeded')
+      .addSelect("COUNT(*) FILTER (WHERE r.status = 'ban')::int", 'banned')
+      .getRawOne<{ approved: string | number; changesNeeded: string | number; banned: string | number }>();
+    const approved = Number(reviewCounts?.approved ?? 0);
+    const changesNeeded = Number(reviewCounts?.changesNeeded ?? 0);
+    const banned = Number(reviewCounts?.banned ?? 0);
+    const decisionCount = approved + changesNeeded + banned;
+    const approvalRate = decisionCount > 0 ? approved / decisionCount : 0;
+
+    const projects = await this.projectRepo.find({
+      where: { status: 'unreviewed' },
+      relations: ['user'],
+    });
+    const projectCount = projects.length;
+
+    if (!this.hackatimeAdminKey || projects.length === 0) {
+      const payload = {
+        totalHours: 0,
+        projectCount,
+        approvalRate,
+        decisionCount,
+        predictedApprovedHours: 0,
+      };
+      this.unreviewedHoursCache = { payload, timestamp: Date.now() };
+      return payload;
+    }
+
+    // Flatten to (project, linked-name) pairs — /spans takes one project name
+    // per request. Skip projects whose owner has no Hackatime linkage; their
+    // contribution is 0 either way.
+    const rows: { hackatimeUserId: string; projectName: string; projectId: string }[] = [];
+    for (const p of projects) {
+      if (!p.user?.hackatimeUserId) continue;
+      if (!p.hackatimeProjectName || p.hackatimeProjectName.length === 0) continue;
+      for (const name of p.hackatimeProjectName) {
+        rows.push({
+          hackatimeUserId: p.user.hackatimeUserId,
+          projectName: name,
+          projectId: p.id,
+        });
+      }
+    }
+
+    const endDatePadded = AdminService.ymdUtc(new Date(Date.now() + 86400_000));
+    const secondsByProject = new Map<string, number>();
+
+    const batchSize = 10;
+    for (let i = 0; i < rows.length; i += batchSize) {
+      const batch = rows.slice(i, i + batchSize);
+      await Promise.allSettled(
+        batch.map(async (row) => {
+          try {
+            const res = await this.hackatimeGet(
+              `/api/v1/users/${encodeURIComponent(row.hackatimeUserId)}/heartbeats/spans` +
+                `?start_date=${AdminService.HACKATIME_EVENT_START}&end_date=${endDatePadded}` +
+                `&project=${encodeURIComponent(row.projectName)}`,
+            );
+            if (!res.ok) return;
+            const data = (await res.json()) as {
+              spans?: { start_time?: number; end_time?: number; duration?: number }[];
+            };
+            let seconds = 0;
+            for (const span of data.spans ?? []) {
+              if (
+                typeof span.duration === 'number' &&
+                Number.isFinite(span.duration) &&
+                span.duration > 0
+              ) {
+                seconds += span.duration;
+                continue;
+              }
+              if (
+                typeof span.start_time === 'number' &&
+                typeof span.end_time === 'number' &&
+                Number.isFinite(span.start_time) &&
+                Number.isFinite(span.end_time) &&
+                span.end_time > span.start_time
+              ) {
+                const diff = span.end_time - span.start_time;
+                seconds += diff > 1e9 ? diff / 1000 : diff;
+              }
+            }
+            secondsByProject.set(
+              row.projectId,
+              (secondsByProject.get(row.projectId) ?? 0) + seconds,
+            );
+          } catch (err) {
+            this.logger.warn(
+              `Unreviewed-hours span fetch failed for project ${row.projectId} (${row.projectName}): ${err}`,
+            );
+          }
+        }),
+      );
+    }
+
+    let totalHours = 0;
+    for (const p of projects) {
+      const hackatimeHours = (secondsByProject.get(p.id) ?? 0) / 3600;
+      const newHours = Math.max(0, hackatimeHours - (p.overrideHours ?? 0));
+      totalHours += newHours;
+    }
+    totalHours = Math.round(totalHours * 10) / 10;
+    const predictedApprovedHours = Math.round(totalHours * approvalRate * 10) / 10;
+
+    const payload = {
+      totalHours,
+      projectCount,
+      approvalRate,
+      decisionCount,
+      predictedApprovedHours,
+    };
+    this.unreviewedHoursCache = { payload, timestamp: Date.now() };
+    return payload;
   }
 
   // ── Daily Active Users ──
@@ -1137,10 +1626,19 @@ export class AdminService {
     linkedHackatime: number;
     submittedProject: number;
     approvedProject: number;
+    madeOrder: number;
   }> {
     const signupsHistory = await this.getSignupsHistory().catch(() => null);
 
-    const [loggedIn, linkedHackatime, submittedRaw, approvedRaw] = await Promise.all([
+    // "approvedProject" counts users with a durable approval event in the
+    // submissions table rather than users whose CURRENT project is in the
+    // 'approved' state. Project status drifts: a reviewer approval first moves
+    // the project to 'fraud_pending' (and only the fraud poller flips it to
+    // 'approved'), and an approved → changes_needed transition wipes the
+    // approved status entirely. Submissions, by contrast, are immutable history
+    // — so counting distinct users with at least one approved submission
+    // captures everyone who's ever been approved.
+    const [loggedIn, linkedHackatime, submittedRaw, approvedRaw, orderRaw] = await Promise.all([
       this.userRepo.count(),
       this.userRepo
         .createQueryBuilder('u')
@@ -1150,10 +1648,14 @@ export class AdminService {
         .createQueryBuilder('p')
         .select('COUNT(DISTINCT p.user_id)', 'c')
         .getRawOne<{ c: string }>(),
-      this.projectRepo
-        .createQueryBuilder('p')
-        .select('COUNT(DISTINCT p.user_id)', 'c')
-        .where('p.status = :status', { status: 'approved' })
+      this.submissionRepo
+        .createQueryBuilder('s')
+        .select('COUNT(DISTINCT s.user_id)', 'c')
+        .where('s.status = :status', { status: 'approved' })
+        .getRawOne<{ c: string }>(),
+      this.orderRepo
+        .createQueryBuilder('o')
+        .select('COUNT(DISTINCT o.user_id)', 'c')
         .getRawOne<{ c: string }>(),
     ]);
 
@@ -1163,6 +1665,7 @@ export class AdminService {
       linkedHackatime,
       submittedProject: Number(submittedRaw?.c ?? 0),
       approvedProject: Number(approvedRaw?.c ?? 0),
+      madeOrder: Number(orderRaw?.c ?? 0),
     };
   }
 
@@ -1206,6 +1709,7 @@ export class AdminService {
     stock?: number | null;
     estimatedShip?: string | null;
     isActive?: boolean;
+    isFeatured?: boolean;
   }): Promise<ShopItem> {
     const maxOrder = await this.shopRepo
       .createQueryBuilder('s')
@@ -1222,6 +1726,7 @@ export class AdminService {
       stock: data.stock ?? null,
       estimatedShip: data.estimatedShip ?? null,
       isActive: data.isActive ?? true,
+      isFeatured: data.isFeatured ?? false,
       sortOrder,
     });
     return this.shopRepo.save(item);
@@ -1236,6 +1741,7 @@ export class AdminService {
     stock?: number | null;
     estimatedShip?: string | null;
     isActive?: boolean;
+    isFeatured?: boolean;
   }): Promise<ShopItem> {
     const item = await this.shopRepo.findOne({ where: { id } });
     if (!item) throw new NotFoundException('Shop item not found');
@@ -1247,6 +1753,7 @@ export class AdminService {
     if (data.stock !== undefined) item.stock = data.stock;
     if (data.estimatedShip !== undefined) item.estimatedShip = data.estimatedShip;
     if (data.isActive !== undefined) item.isActive = data.isActive;
+    if (data.isFeatured !== undefined) item.isFeatured = data.isFeatured;
     return this.shopRepo.save(item);
   }
 
@@ -1260,5 +1767,76 @@ export class AdminService {
     await Promise.all(
       items.map((i) => this.shopRepo.update(i.id, { sortOrder: i.sortOrder })),
     );
+  }
+
+  /**
+   * Super-admin-only order detail for fulfillment: returns the buyer's address
+   * (fetched live from HCA — never persisted in beest) plus their approved
+   * projects so fulfillment staff can verify what to ship.
+   */
+  async getOrderDetailForFulfillment(orderId: string): Promise<{
+    address: {
+      streetAddress: string | null;
+      locality: string | null;
+      region: string | null;
+      postalCode: string | null;
+      country: string | null;
+    } | null;
+    addressMissing: boolean;
+    projects: {
+      id: string;
+      name: string;
+      projectType: string | null;
+      hours: number | null;
+      approvedAt: string;
+    }[];
+  }> {
+    const order = await this.orderRepo.findOne({
+      where: { id: orderId },
+      relations: ['user'],
+    });
+    if (!order) throw new NotFoundException('Order not found');
+
+    const user = order.user;
+
+    const [identity, projects] = await Promise.all([
+      user?.hcaSub ? this.hcaService.getIdentity(user.hcaSub) : Promise.resolve(null),
+      this.projectRepo
+        .createQueryBuilder('project')
+        .where('project.userId = :uid', { uid: order.userId })
+        .andWhere('project.status = :status', { status: 'approved' })
+        .select([
+          'project.id',
+          'project.name',
+          'project.projectType',
+          'project.overrideHours',
+          'project.updatedAt',
+        ])
+        .orderBy('project.updatedAt', 'DESC')
+        .getMany(),
+    ]);
+
+    const addr = identity?.address ?? null;
+    const address = addr
+      ? {
+          streetAddress: addr.street_address ?? null,
+          locality: addr.locality ?? null,
+          region: addr.region ?? null,
+          postalCode: addr.postal_code ?? null,
+          country: addr.country ?? null,
+        }
+      : null;
+
+    return {
+      address,
+      addressMissing: !address,
+      projects: projects.map((p) => ({
+        id: p.id,
+        name: p.name,
+        projectType: p.projectType ?? null,
+        hours: p.overrideHours ?? null,
+        approvedAt: p.updatedAt.toISOString(),
+      })),
+    };
   }
 }

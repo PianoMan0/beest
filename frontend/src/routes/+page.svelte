@@ -232,13 +232,14 @@
 <section class="what-is-this">
   <h2>What is this?</h2>
   <p>
-    Beest is a <a href="https://hackclub.com" target="_blank" rel="noreferrer">Hack Club</a> program.
-    A Beest (Strandbeest) is a sail powered mechanical animal constructed of just fabric, plastic pipes,
-    zip ties and recycled plastic bottles. I think they are the coolest thing ever, and if you agree,
-    you can join me in building one! Everything (including flights, food and accommodation) is totally
-    free for teenagers who qualify by building a project. From [Date] to [Date] you and [X] teens will
-    fly to the Netherlands to build a StrandBeest, present it to the creator of strandbeests and watch
-    him exhibit the full collection!
+    Beest is a <a href="https://hackclub.com" target="_blank" rel="noreferrer">Hack Club</a> Event
+    running <strong>August 16–21</strong> in the Netherlands.
+    We're flying 50 teens out to build walking mechanisms on the same beach the famous
+    Strandbeest was constructed. A strandbeest is a kinetic sculpture - a giant walking mechanism of
+    pipe and cloth (no motors), and we'll be going to watch the display of the strandbeests
+    during the event! Everything (including flights, food and accommodation) is totally free for
+    teenagers who qualify by building a project. Can't come? We're also providing funding and prizes
+    for every teen who ships a technical project.
   </p>
 </section>
 
@@ -874,6 +875,8 @@
   }
 
   .rsvp-box {
+    position: relative;
+    z-index: 1;
     flex: 0 0 380px;
     align-self: flex-start;
     box-sizing: border-box;
@@ -1580,6 +1583,39 @@
   }
 
   @media (max-width: 900px) {
+    .sticker-cta::after,
+    .what-is-this::after,
+    .info-bg::after,
+    .sticker-bg::after,
+    .carousel-section::after,
+    .hackclub-section::after,
+    .bottom-rsvp::after,
+    .rock-strata::after,
+    .site-footer::after {
+      mix-blend-mode: normal;
+      opacity: 0.05;
+    }
+
+    .hero-mobile {
+      display: block;
+    }
+
+    .hero-scroll-space {
+      height: auto;
+    }
+
+    .hero-wrap {
+      position: relative;
+    }
+
+    .hero-parallax {
+      display: none;
+    }
+
+    .scroll-hint {
+      display: none;
+    }
+
     .hackclub-section {
       padding: 40px 20px 0;
     }

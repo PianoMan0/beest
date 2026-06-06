@@ -16,12 +16,14 @@ import type { Request } from 'express';
 import { AuthService, ALLOWED_GENDERS, type Gender } from './auth.service';
 import { JwtAuthGuard } from './jwt-auth.guard';
 import { RsvpService } from '../rsvp/rsvp.service';
+import { IdentityService } from '../identity/identity.service';
 
 @Controller('api/auth')
 export class AuthController {
   constructor(
     private readonly authService: AuthService,
     private readonly rsvpService: RsvpService,
+    private readonly identityService: IdentityService,
   ) {}
 
   @Throttle({ default: { limit: 10, ttl: 60000 } })
@@ -38,6 +40,13 @@ export class AuthController {
       code: string;
       state: string;
       storedState: string;
+      attribution?: {
+        utm_source?: string | null;
+        utm_medium?: string | null;
+        utm_campaign?: string | null;
+        referrer?: string | null;
+        landing_path?: string | null;
+      };
     },
   ) {
     if (!body.code) {
@@ -51,6 +60,7 @@ export class AuthController {
         body.code,
         body.state,
         body.storedState,
+        body.attribution,
       );
     } catch {
       throw new UnauthorizedException('Authentication failed');
@@ -100,11 +110,19 @@ export class AuthController {
   @Get('shipping-eligibility')
   async shippingEligibility(@Req() req: Request) {
     const user = (req as any).user;
+    const hasAddress = !!user.has_address;
+    const hasBirthdate = !!user.has_birthdate;
+    const identityVerified = await this.identityService.isVerified({
+      slackId: user.slack_id,
+      email: user.email,
+    });
     return {
-      hasAddress: !!user.has_address,
-      hasBirthdate: !!user.has_birthdate,
-      eligible: !!user.has_address && !!user.has_birthdate,
+      hasAddress,
+      hasBirthdate,
+      identityVerified,
+      eligible: hasAddress && hasBirthdate && identityVerified,
       addressPortalUrl: 'https://auth.hackclub.com/portal/address',
+      identityPortalUrl: 'https://auth.hackclub.com/verifications/document',
     };
   }
 
@@ -132,6 +150,7 @@ export class AuthController {
     const scopeRequirements: Record<string, string[]> = {
       admin: ['Super Admin'],
       reviewer: ['Super Admin', 'Reviewer', 'Fraud Reviewer'],
+      audit: ['Super Admin', 'Fraud Reviewer'],
     };
 
     const allowed = scopeRequirements[scope];
@@ -172,6 +191,28 @@ export class AuthController {
       throw new BadRequestException('Invalid gender value');
     }
     return this.authService.updateGender(uid, gender as Gender);
+  }
+
+  @UseGuards(JwtAuthGuard)
+  @Get('intent')
+  async getIntent(@Req() req: Request) {
+    const uid = (req as any).user?.uid;
+    if (!uid) throw new UnauthorizedException();
+    return this.authService.getIntentStatus(uid);
+  }
+
+  @Throttle({ default: { limit: 10, ttl: 60000 } })
+  @UseGuards(JwtAuthGuard)
+  @Post('intent')
+  async setIntent(@Req() req: Request, @Body() body: { choice?: string }) {
+    const uid = (req as any).user?.uid;
+    if (!uid) throw new UnauthorizedException();
+    const choice = body.choice;
+    const allowed = ['Hackathon', 'Shop', 'Browsing', 'Both'];
+    if (!choice || !allowed.includes(choice)) {
+      throw new BadRequestException(`choice must be one of: ${allowed.join(', ')}`);
+    }
+    return this.authService.setIntent(uid, choice);
   }
 
   /**

@@ -42,6 +42,11 @@ export class User {
   @Column({ nullable: true })
   gender: string;
 
+  // Answer to the one-time "here for the hackathon or the shop?" home prompt.
+  // null = not answered yet → the modal keeps showing until they pick one.
+  @Column({ type: 'varchar', length: 20, nullable: true })
+  intent: string | null;
+
   @Column({
     nullable: true,
     name: 'hackatime_token',
@@ -68,6 +73,21 @@ export class User {
 
   @Column({ type: 'integer', default: 0 })
   pipes: number;
+
+  @Column({ nullable: true, name: 'utm_source' })
+  utmSource: string;
+
+  @Column({ nullable: true, name: 'utm_medium' })
+  utmMedium: string;
+
+  @Column({ nullable: true, name: 'utm_campaign' })
+  utmCampaign: string;
+
+  @Column({ nullable: true })
+  referrer: string;
+
+  @Column({ nullable: true, name: 'landing_path' })
+  landingPath: string;
 
   @CreateDateColumn({ name: 'created_at' })
   createdAt: Date;

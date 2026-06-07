@@ -1096,6 +1096,7 @@
 
   .carousel-section {
     position: relative;
+    z-index: 2;
     overflow-x: hidden;
     overflow-y: visible;
     padding: 80px 0 80px;
